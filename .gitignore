@@ -1,0 +1,5 @@
+# build artifacts / temporary
+*.xlsx
+*.csv.queue
+~$*.xls*
+.vscode/
