@@ -17,6 +17,7 @@ for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "$([DateTime]:
 set "OUTDIR=%OUTROOT%\%TS%"
 mkdir "%OUTDIR%" >nul 2>nul
 set "OUT=%OUTDIR%\TeamsNet-RTT-ByHost.xlsx"
+set "LOG=%OUTDIR%\run.log"
 
 rem ルートの target.txt があれば自動使用
 set "TARGET=%BASE%target.txt"
@@ -27,24 +28,43 @@ rem 使う PowerShell を決定（Windows PowerShell → PowerShell 7 の順）
 set "PSCMD="
 where powershell >nul 2>nul && set "PSCMD=powershell -NoProfile -ExecutionPolicy Bypass"
 if not defined PSCMD (
-  where pwsh >nul 2>nul && set "PSCMD=pwsh -NoProfile"
+  where pwsh >nul 2>nul && set "PSCMD=pwsh -NoProfile -ExecutionPolicy Bypass"
 )
 if not defined PSCMD (
   echo ERROR: PowerShell not found. Install Windows PowerShell or PowerShell 7.
   exit /b 1
 )
 
+echo BASE   = "%BASE%"
+echo OUTDIR = "%OUTDIR%"
+echo OUT    = "%OUT%"
+echo PS1    = "%PS1%"
+echo TARGET = "%TARGET%"
 echo Running: %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG%
-%PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG%
+echo ------------------------------------------------------------ > "%LOG%"
+echo Command: %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG% >> "%LOG%"
+echo ------------------------------------------------------------ >> "%LOG%"
+
+%PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG% 1>>"%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
-echo Done. Output: "%OUT%"
-start "" "%OUT%" 2>nul
-exit /b 0
+if exist "%OUT%" (
+  echo Done. Output: "%OUT%"
+  start "" "%OUT%" 2>nul
+  exit /b 0
+) else (
+  echo ERROR: Script reported success but file not found.
+  echo ERROR: Expected output: "%OUT%"
+  echo See log: "%LOG%"
+  exit /b 2
+)
 
 :fail
 echo.
 echo === Failed with exit code %errorlevel% ===
-echo - Check that "%OUTDIR%" is writable.
-echo - Ensure teams_net_quality.csv exists in %%LOCALAPPDATA%%\TeamsNet.
+echo See log: "%LOG%"
+echo - よくある原因:
+echo   1) teams_net_quality.csv が %%LOCALAPPDATA%%\TeamsNet に無い
+echo   2) Excel(COM)起動不可 / Excel未インストール
+echo   3) 出力先(UNC/NAS)への保存権限やロック
 exit /b %errorlevel%
