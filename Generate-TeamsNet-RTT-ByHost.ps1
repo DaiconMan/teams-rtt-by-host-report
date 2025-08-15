@@ -15,7 +15,7 @@ Generate-TeamsNet-RTT-ByHost.ps1
 param(
   [string]$InputDir   = (Join-Path $Env:LOCALAPPDATA "TeamsNet"),
   [Parameter(Mandatory=$true)][string]$Output,
-  [string]$TargetsFile,     # 省略時: InputDir\target.txt → スクリプト隣も探索
+  [string]$TargetsFile,     # 省略時: スクリプト隣の target.txt → %LOCALAPPDATA%\TeamsNet\target.txt
   [int]$ThresholdMs = 100,
   [switch]$Visible
 )
@@ -41,9 +41,10 @@ $csv = Join-Path $InputDir "teams_net_quality.csv"
 if(-not (Test-Path $csv)){ throw "CSV が見つかりません: $csv" }
 
 if(-not $TargetsFile){
-  $TargetsFile = Join-Path $InputDir "target.txt"
+  # まずスクリプト隣を優先
+  $TargetsFile = Join-Path $PSScriptRoot "target.txt"
   if(-not (Test-Path $TargetsFile)){
-    $TargetsFile = Join-Path $PSScriptRoot "target.txt"
+    $TargetsFile = Join-Path $InputDir "target.txt"
   }
 }
 if(-not (Test-Path $TargetsFile)){ throw "TargetsFile が見つかりません: $TargetsFile" }
@@ -177,9 +178,9 @@ foreach($h in $targets){
     # 閾値列を埋める
     $ws.Range("C2:C$lastRow").Value2 = $ThresholdMs
 
-    # 表示形式＆念のため数値化
+    # 表示形式＆必要なら数値化
     $ws.Range("A2:A$lastRow").NumberFormat = "mm/dd hh:mm"
-    # 文字列扱いの日時を数値化したい場合は下の2行のコメントを外す
+    # 文字列→数値に強制変換したい場合は以下を有効化
     # $ws.Range("A2:A$lastRow").FormulaR1C1 = "=IF(RC[0]="""","""",RC[0]+0)"
     # $ws.Range("A2:A$lastRow").Value2      = $ws.Range("A2:A$lastRow").Value2
 

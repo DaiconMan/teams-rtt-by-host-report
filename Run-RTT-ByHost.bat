@@ -14,7 +14,7 @@ for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]
 if not defined DESK set "DESK=%USERPROFILE%\Desktop"
 set "OUT=%DESK%\TeamsNet-RTT-ByHost.xlsx"
 
-rem ルートの target.txt があれば使う（無ければPS1の既定に任せる）
+rem ルートの target.txt があれば自動使用
 set "TARGET=%BASE%target.txt"
 set "TARGETARG="
 if exist "%TARGET%" set "TARGETARG=-TargetsFile ""%TARGET%"""
