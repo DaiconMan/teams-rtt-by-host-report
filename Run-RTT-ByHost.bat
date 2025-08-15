@@ -9,10 +9,14 @@ if not exist "%PS1%" (
   exit /b 1
 )
 
-rem デスクトップの実パスを PowerShell で取得（OneDrive等でも安全）
-for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set "DESK=%%D"
-if not defined DESK set "DESK=%USERPROFILE%\Desktop"
-set "OUT=%DESK%\TeamsNet-RTT-ByHost.xlsx"
+rem === 出力先: BASE\Output\yyyyMMdd_HHmmss\TeamsNet-RTT-ByHost.xlsx ===
+set "OUTROOT=%BASE%Output"
+if not exist "%OUTROOT%" mkdir "%OUTROOT%"
+
+for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "$([DateTime]::Now.ToString('yyyyMMdd_HHmmss'))"`) do set "TS=%%T"
+set "OUTDIR=%OUTROOT%\%TS%"
+mkdir "%OUTDIR%" >nul 2>nul
+set "OUT=%OUTDIR%\TeamsNet-RTT-ByHost.xlsx"
 
 rem ルートの target.txt があれば自動使用
 set "TARGET=%BASE%target.txt"
@@ -32,16 +36,15 @@ if not defined PSCMD (
 
 echo Running: %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG%
 %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG%
-set "ERR=%ERRORLEVEL%"
-
-if not "%ERR%"=="0" (
-  echo.
-  echo === Failed with exit code %ERR% ===
-  echo - Close the Excel file if "%OUT%" is open.
-  echo - Ensure teams_net_quality.csv exists in %%LOCALAPPDATA%%\TeamsNet.
-  exit /b %ERR%
-)
+if errorlevel 1 goto :fail
 
 echo Done. Output: "%OUT%"
 start "" "%OUT%" 2>nul
-endlocal
+exit /b 0
+
+:fail
+echo.
+echo === Failed with exit code %errorlevel% ===
+echo - Check that "%OUTDIR%" is writable.
+echo - Ensure teams_net_quality.csv exists in %%LOCALAPPDATA%%\TeamsNet.
+exit /b %errorlevel%
