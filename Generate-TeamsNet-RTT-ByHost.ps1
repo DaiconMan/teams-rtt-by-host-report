@@ -1,268 +1,328 @@
-<#
-Generate-TeamsNet-RTT-ByHost.ps1
-- ピボット非依存。target.txt のホストだけ抽出し、RTT(icmp_avg_ms)を「ホストごと1枚」の折れ線で出力。
-- 仕様:
-  * 日付表示 mm/dd hh:mm（X軸は時間スケール）
-  * ホストごとに線色固定（安定ハッシュ）
-  * 閾値線 100ms（赤・破線）
-  * 縦軸 0〜300ms 固定（主目盛 50ms）
-  * 文字列として取り込まれた timestamp/RTT を強制数値化してグラフ化
+﻿<#
+Generate-TeamsNet-RTT-ByHost.ps1 (bucketed & locale-safe, no Excel formulas)
+- Build per-host RTT charts from teams_net_quality.csv for hosts in target.txt.
+- Aggregation is done in PowerShell (sum/count -> avg). No Excel worksheet formulas.
+- BucketMinutes=60 (hourly) by default. If buckets < 2, falls back to raw series.
+- Y axis: 0..300ms, X axis: hourly ticks, threshold 100ms (red dashed), stable per-host color.
+
+Usage example:
+  powershell -NoProfile -ExecutionPolicy Bypass `
+    -File .\Generate-TeamsNet-RTT-ByHost.ps1 `
+    -Output ".\Output\TeamsNet-RTT-ByHost.xlsx" `
+    -TargetsFile ".\target.txt" `
+    -BucketMinutes 60
 #>
 
 param(
-  [string]$InputDir   = (Join-Path $Env:LOCALAPPDATA "TeamsNet"),
+  [string]$InputDir   = (Join-Path $Env:LOCALAPPDATA 'TeamsNet'),
   [Parameter(Mandatory=$true)][string]$Output,
-  [string]$TargetsFile,   # 省略時: スクリプト隣の target.txt → %LOCALAPPDATA%\TeamsNet\target.txt
+  [string]$TargetsFile,
   [int]$ThresholdMs = 100,
+  [int]$BucketMinutes = 60,
   [switch]$Visible
 )
 
-# ===== Excel 定数 =====
-$xlDelimited            = 1
-$xlYes                  = 1
-$xlLine                 = 4
-$xlLegendPositionBottom = -4107
-$xlSrcRange             = 1
-$xlInsertDeleteCells    = 2
-$xlCellTypeVisible      = 12
-$xlUp                   = -4162
-$xlCategory             = 1
-$xlValue                = 2
-$xlTimeScale            = 3
-$msoLineDash            = 4
+# Excel consts
+$xlDelimited=1; $xlYes=1; $xlLine=4; $xlLegendBottom=-4107
+$xlSrcRange=1; $xlInsertDeleteCells=2; $xlCellTypeVisible=12
+$xlUp=-4162; $xlCategory=1; $xlValue=2; $xlTimeScale=3
+$msoLineDash=4
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference='Stop'
 
-# 入力CSV
-$csv = Join-Path $InputDir "teams_net_quality.csv"
-if(-not (Test-Path $csv)){ throw "CSV が見つかりません: $csv" }
-
-# target.txt 探索
-if(-not $TargetsFile){
-  $TargetsFile = Join-Path $PSScriptRoot "target.txt"
-  if(-not (Test-Path $TargetsFile)){
-    $TargetsFile = Join-Path $InputDir "target.txt"
-  }
-}
-if(-not (Test-Path $TargetsFile)){ throw "TargetsFile が見つかりません: $TargetsFile" }
-
-# 対象ホストの読み込み
-$targets = Get-Content -Raw -Encoding UTF8 $TargetsFile |
-  ForEach-Object { $_ -split "`r?`n" } |
-  Where-Object { $_ -and (-not $_.Trim().StartsWith("#")) } |
-  ForEach-Object { $_.Trim() } | Select-Object -Unique
-if(-not $targets -or $targets.Count -eq 0){ throw "target.txt に有効なホストがありません。" }
-
-# 出力フォルダ
-$outDir = Split-Path -Parent $Output
-if($outDir -and -not (Test-Path $outDir)){ New-Item -ItemType Directory -Path $outDir | Out-Null }
-
-# Excel 起動
-try { $excel = New-Object -ComObject Excel.Application } catch { throw "Excel の COM を起動できません（Excel が必要）。" }
-$excel.Visible = [bool]$Visible
-$excel.DisplayAlerts = $false
-$wb = $excel.Workbooks.Add()
-
-# 既定シート整理
-while($wb.Worksheets.Count -gt 1){ $wb.Worksheets.Item(1).Delete() }
-$wb.Worksheets.Item(1).Name = "AllData"
-
+# ---------- helpers ----------
 function Sanitize-SheetName([string]$name){
-  if(-not $name){ return "Host" }
+  if(-not $name){ return 'Host' }
   $n = $name -replace '[:\\/\?\*\[\]]','_'
   if($n.Length -gt 31){ $n = $n.Substring(0,31) }
-  if($n -match '^\s*$'){ $n = "Host" }
+  if($n -match '^\s*$'){ $n = 'Host' }
   return $n
 }
-
-# $host 自動変数衝突を避けるため、引数名は $HostName に
 function Get-HostColor([string]$HostName){
-  $palette = @(
+  $palette=@(
     @{r= 33; g=150; b=243}, @{r= 76; g=175; b= 80}, @{r=244; g= 67; b= 54},
     @{r=255; g=193; b=  7}, @{r=156; g= 39; b=176}, @{r=  0; g=188; b=212},
     @{r=121; g= 85; b= 72}, @{r= 63; g= 81; b=181}, @{r=205; g=220; b= 57},
     @{r=233; g= 30; b= 99}
   )
-  $sum = 0; $HostName.ToCharArray() | ForEach-Object { $sum += [int]$_ }
-  $idx = $sum % $palette.Count
-  $c = $palette[$idx]
+  $sum=0; $HostName.ToCharArray() | ForEach-Object { $sum += [int]$_ }
+  $c=$palette[$sum % $palette.Count]
   return [int]($c.r + ($c.g -shl 8) + ($c.b -shl 16))
 }
+function Write-Column2D($ws, [string]$addr, [object[]]$arr){
+  $n = if($arr){ [int]$arr.Count } else { 0 }
+  if($n -le 0){ return }
+  $data = New-Object 'object[,]' $n,1
+  for($i=0;$i -lt $n;$i++){ $data[$i,0]=$arr[$i] }
+  $ws.Range($addr).Resize($n,1).Value2 = $data
+}
+function New-RepeatedArray([object]$value, [int]$count){
+  if($count -le 0){ return @() }
+  $a = New-Object object[] $count
+  for($i=0;$i -lt $count;$i++){ $a[$i] = $value }
+  return $a
+}
 
-# AllData 取り込み（QueryTable → データ残し → テーブル化）
-$wsAll = $wb.Worksheets("AllData")
+# ---------- inputs ----------
+$csv = Join-Path $InputDir 'teams_net_quality.csv'
+if(-not (Test-Path $csv)){ throw 'CSV not found: ' + $csv }
+
+if(-not $TargetsFile){
+  $TargetsFile = Join-Path $PSScriptRoot 'target.txt'
+  if(-not (Test-Path $TargetsFile)){
+    $TargetsFile = Join-Path $InputDir 'target.txt'
+  }
+}
+if(-not (Test-Path $TargetsFile)){ throw 'Targets file not found: ' + $TargetsFile }
+
+$targets = Get-Content -Raw -Encoding UTF8 $TargetsFile |
+  ForEach-Object { $_ -split "`r?`n" } |
+  Where-Object { $_ -and (-not $_.Trim().StartsWith('#')) } |
+  ForEach-Object { $_.Trim() } | Select-Object -Unique
+if(-not $targets -or $targets.Count -eq 0){ throw 'No valid hosts in target.txt' }
+
+# ---------- Excel ----------
+try { $excel = New-Object -ComObject Excel.Application } catch { throw 'Cannot start Excel COM. Is Excel installed?' }
+$excel.Visible = [bool]$Visible
+$excel.DisplayAlerts = $false
+$wb = $excel.Workbooks.Add()
+while($wb.Worksheets.Count -gt 1){ $wb.Worksheets.Item(1).Delete() }
+$wb.Worksheets.Item(1).Name = 'AllData'
+$wsAll = $wb.Worksheets('AllData')
+
+# import CSV
 try { foreach($qt in @($wsAll.QueryTables())){ $qt.Delete() } } catch {}
 try { foreach($lo in @($wsAll.ListObjects())){ $lo.Unlist() } } catch {}
 $wsAll.Cells.Clear()
 
-$qt = $wsAll.QueryTables.Add("TEXT;" + $csv, $wsAll.Range("A1"))
-$qt.TextFileParseType            = $xlDelimited
-$qt.TextFileCommaDelimiter       = $true
-$qt.TextFilePlatform             = 65001
+$qt = $wsAll.QueryTables.Add('TEXT;' + $csv, $wsAll.Range('A1'))
+$qt.TextFileParseType = $xlDelimited
+$qt.TextFileCommaDelimiter = $true
+$qt.TextFilePlatform = 65001
 $qt.TextFileTrailingMinusNumbers = $true
-$qt.AdjustColumnWidth            = $true
-$qt.RefreshStyle                 = $xlInsertDeleteCells
-$qt.Refresh() | Out-Null
-
+$qt.AdjustColumnWidth = $true
+$qt.RefreshStyle = $xlInsertDeleteCells
+$null = $qt.Refresh()
 $rng = $qt.ResultRange
-if(-not $rng){ throw "CSV にデータが無いか、取り込みに失敗しました: $csv" }
+if(-not $rng){ throw 'CSV import failed or empty: ' + $csv }
 $qt.Delete()
 
 $loAll = $wsAll.ListObjects.Add($xlSrcRange, $rng, $null, $xlYes)
-$loAll.Name = "tblAll"
-$wsAll.Columns.AutoFit() | Out-Null
+$loAll.Name = 'tblAll'
+$null = $wsAll.Columns.AutoFit()
 
-# 必須列
-function Try-GetColIndex($listObject, [string]$colName){ try { return $listObject.ListColumns($colName).Index } catch { return $null } }
-$colHost = Try-GetColIndex $loAll "host"
-$colTime = Try-GetColIndex $loAll "timestamp"
-$colRtt  = Try-GetColIndex $loAll "icmp_avg_ms"
+function Try-GetColIndex($listObject,[string]$col){ try { return $listObject.ListColumns($col).Index } catch { return $null } }
+$colHost = Try-GetColIndex $loAll 'host'
+$colTime = Try-GetColIndex $loAll 'timestamp'
+$colRtt  = Try-GetColIndex $loAll 'icmp_avg_ms'
 if($null -eq $colHost -or $null -eq $colTime -or $null -eq $colRtt){
-  throw "必要列 'host','timestamp','icmp_avg_ms' が見つかりません。"
+  throw 'Required columns missing: host, timestamp, icmp_avg_ms'
 }
+try { $loAll.ListColumns('timestamp').DataBodyRange.NumberFormatLocal = 'yyyy/mm/dd hh:mm' } catch {}
+try { $loAll.ListColumns('icmp_avg_ms').DataBodyRange.NumberFormatLocal = '0.0' } catch {}
 
-# 表示形式だけ先に
-try { $loAll.ListColumns("timestamp").DataBodyRange.NumberFormat = "mm/dd hh:mm" } catch {}
-try { $loAll.ListColumns("icmp_avg_ms").DataBodyRange.NumberFormat = "0.0" } catch {}
+# ---------- per host ----------
+$created=@()
+$frac = [double]$BucketMinutes / 1440.0
+$ciInv = [System.Globalization.CultureInfo]::InvariantCulture
+$ciCur = [System.Globalization.CultureInfo]::CurrentCulture
 
-# ===== 各ホストごと =====
-$created = @()
 foreach($h in $targets){
-  # フィルター
-  $loAll.Range.AutoFilter($colHost, $h) | Out-Null
-  $visTime = $loAll.ListColumns("timestamp").DataBodyRange.SpecialCells($xlCellTypeVisible)
-  $visRtt  = $loAll.ListColumns("icmp_avg_ms").DataBodyRange.SpecialCells($xlCellTypeVisible)
+  # filter rows for this host
+  $null = $loAll.Range.AutoFilter($colHost, $h)
+  $timeVis = $loAll.ListColumns('timestamp').DataBodyRange.SpecialCells($xlCellTypeVisible)
+  $rttVis  = $loAll.ListColumns('icmp_avg_ms').DataBodyRange.SpecialCells($xlCellTypeVisible)
 
-  # 可視行数
-  $rowCount = 0
-  try { $rowCount = $visTime.Areas | ForEach-Object { $_.Rows.Count } | Measure-Object -Sum | Select-Object -ExpandProperty Sum } catch { $rowCount = 0 }
-
-  if($rowCount -gt 0){
-    $sheetName = Sanitize-SheetName $h
-    try {
-      $ws = $wb.Worksheets.Item($sheetName)
-      $ws.Cells.Clear()
-      try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
-    } catch {
-      $ws = $wb.Worksheets.Add(); $ws.Name = $sheetName
-    }
-
-    # 見出し
-    $ws.Cells(1,1).Value2 = "timestamp"
-    $ws.Cells(1,2).Value2 = "icmp_avg_ms"
-    $ws.Cells(1,3).Value2 = "threshold_ms"
-
-    # 可視セルを貼付
-    $visTime.Copy($ws.Range("A2")) | Out-Null
-    $visRtt.Copy($ws.Range("B2"))  | Out-Null
-
-    # 最終行
-    $lastRow = $ws.Cells($ws.Rows.Count, 1).End($xlUp).Row
-    if($lastRow -lt 2){
-      $loAll.AutoFilter.ShowAllData() | Out-Null 2>$null
-      continue
-    }
-
-    # === 重要: 文字列→数値へ強制変換（X:日時、Y:RTT） ===
-    # A列: "yyyy-mm-dd hh:mm:ss" などを LEFT/MID + DATEVALUE/TIMEVALUE で確実に数値化
-    $ws.Range("D1").Value2 = "ts_numeric"
-    $ws.Range("D2:D$lastRow").FormulaR1C1 = "=DATEVALUE(LEFT(RC[-3],10))+TIMEVALUE(MID(RC[-3],12,8))"
-    $ws.Range("A2:A$lastRow").Value2 = $ws.Range("D2:D$lastRow").Value2
-    $ws.Range("D:D").Clear()
-
-    # B列: RTT も VALUE() で数値化（千区切りや文字列対策）
-    $ws.Range("E1").Value2 = "rtt_numeric"
-    $ws.Range("E2:E$lastRow").FormulaR1C1 = "=IF(RC[-3]="""","""",VALUE(RC[-3]))"
-    $ws.Range("B2:B$lastRow").Value2 = $ws.Range("E2:E$lastRow").Value2
-    $ws.Range("E:E").Clear()
-
-    # 閾値列
-    $ws.Range("C2:C$lastRow").Value2 = $ThresholdMs
-
-    # 表示形式
-    $ws.Range("A2:A$lastRow").NumberFormat = "mm/dd hh:mm"
-    $ws.Range("B2:B$lastRow").NumberFormat = "0.0"
-
-    # グラフ
+  # create/clear host sheet
+  $sn = Sanitize-SheetName $h
+  try {
+    $ws = $wb.Worksheets.Item($sn); $ws.Cells.Clear()
     try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
-    $ch  = $ws.ChartObjects().Add(300, 10, 900, 320)
-    $ch.Name = "chtRTT"
-    $chC = $ch.Chart
-    $chC.ChartType = $xlLine
-    $chC.HasTitle  = $true
-    $chC.ChartTitle.Text = "RTT (icmp_avg_ms) - " + $h
-    $chC.Legend.Position = $xlLegendPositionBottom
-    try { $chC.SeriesCollection().Delete() } catch {}
+  } catch { $ws = $wb.Worksheets.Add(); $ws.Name=$sn }
 
-    # RTTシリーズ（ホスト色）
-    $sColor = Get-HostColor $h
-    $s1 = $chC.SeriesCollection().NewSeries()
-    $s1.Name    = $h
+  # headers
+  $ws.Cells(1,1).Value2='timestamp'
+  $ws.Cells(1,2).Value2='icmp_avg_ms'
+  $ws.Cells(1,3).Value2='threshold_ms'
+
+  # paste visible raw to A/B
+  $null = $timeVis.Copy($ws.Range('A2'))
+  $null = $rttVis.Copy($ws.Range('B2'))
+  $lastRow = $ws.Cells($ws.Rows.Count,1).End($xlUp).Row
+
+  if($lastRow -lt 2){
+    try { $null = $loAll.AutoFilter.ShowAllData() } catch {}
+    continue
+  }
+
+  # threshold col
+  $ws.Range("C2:C$lastRow").Value2 = $ThresholdMs
+
+  # formats (guarded)
+  try { $ws.Range("A2:A$lastRow").NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
+  try { $ws.Range("B2:B$lastRow").NumberFormatLocal='0.0' } catch {}
+
+  # ---------- read raw A/B and aggregate in PowerShell ----------
+  $rngAraw = $ws.Range("A2:A$lastRow").Value2
+  $rngBraw = $ws.Range("B2:B$lastRow").Value2
+
+  # normalize Value2 -> 2D array [row,col]
+  if(-not ($rngAraw -is [Array])){ $rngA = New-Object 'object[,]' 1,1; $rngA[0,0]=$rngAraw } else { $rngA=$rngAraw }
+  if(-not ($rngBraw -is [Array])){ $rngB = New-Object 'object[,]' 1,1; $rngB[0,0]=$rngBraw } else { $rngB=$rngBraw }
+
+  $rows = $rngA.GetLength(0)
+  $times = New-Object double[] $rows
+  $rtts  = New-Object double[] $rows
+
+  for($i=0;$i -lt $rows;$i++){
+    # timestamp -> OADate(double)
+    $t = $rngA[$i,0]
+    if($t -is [double]){
+      $tNum = [double]$t
+    } else {
+      $tStr = [string]$t
+      try {
+        $dt = [datetime]::Parse($tStr, $ciCur)
+      } catch {
+        try { $dt = [datetime]::Parse($tStr, $ciInv) } catch { continue }
+      }
+      $tNum = $dt.ToOADate()
+    }
+    # rtt -> double
+    $v = $rngB[$i,0]
+    if($v -is [double]){
+      $rNum = [double]$v
+    } else {
+      $tmp=0.0
+      if([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $ciInv, [ref]$tmp)){
+        $rNum = $tmp
+      } elseif([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $ciCur, [ref]$tmp)){
+        $rNum = $tmp
+      } else { continue }
+    }
+    $times[$i]=$tNum
+    $rtts[$i]=$rNum
+  }
+
+  # build bucket sums
+  $agg = @{}   # key: double bucketOADate -> @{sum=...,cnt=...}
+  for($i=0;$i -lt $rows;$i++){
+    $t=[double]$times[$i]; $r=[double]$rtts[$i]
+    if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
+    $b = [math]::Floor($t / $frac) * $frac
+    $entry = $agg[$b]
+    if(-not $entry){ $entry = @{sum=0.0; cnt=0}; $agg[$b]=$entry }
+    $entry.sum = $entry.sum + $r
+    $entry.cnt = $entry.cnt + 1
+  }
+
+  # create series data: if >=2 buckets use bucket avg; else fallback to raw
+  $useBuckets = ($agg.Keys.Count -ge 2)
+  if($useBuckets){
+    $keys = $agg.Keys | Sort-Object
+    $xs = New-Object object[] $keys.Count
+    $ys = New-Object object[] $keys.Count
+    for($k=0;$k -lt $keys.Count;$k++){
+      $b = [double]$keys[$k]
+      $avg = if($agg[$b].cnt -gt 0){ $agg[$b].sum / $agg[$b].cnt } else { [double]::NaN }
+      $xs[$k] = $b
+      $ys[$k] = $avg
+    }
+
+    # write to F/G/H
+    $ws.Cells(1,6).Value2='bucket'
+    $ws.Cells(1,7).Value2='avg_rtt'
+    $ws.Cells(1,8).Value2='threshold_bucket'
+    Write-Column2D $ws "F2" $xs
+    Write-Column2D $ws "G2" $ys
+    $thr = New-RepeatedArray -value $ThresholdMs -count $xs.Count
+    Write-Column2D $ws "H2" $thr
+    try { $ws.Range(("F2:F{0}" -f (1+$xs.Count))).NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
+    try { $ws.Range(("G2:G{0}" -f (1+$ys.Count))).NumberFormatLocal='0.0' } catch {}
+    $null = $ws.Columns("A:H").AutoFit()
+
+    # chart from F/G/H
+    try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
+    $ch = $ws.ChartObjects().Add(300,10,900,320)
+    $ch.Name='chtRTT'
+    $c = $ch.Chart
+    $c.ChartType = $xlLine
+    $c.HasTitle  = $true
+    $c.ChartTitle.Text = 'RTT hourly avg (icmp_avg_ms) - ' + $h
+    $c.Legend.Position = $xlLegendBottom
+    try { $c.SeriesCollection().Delete() } catch {}
+
+    $rgb = Get-HostColor $h
+    $endRow = 1 + $xs.Count   # F2..F{endRow}
+    $s1 = $c.SeriesCollection().NewSeries()
+    $s1.Name = $h
+    $s1.XValues = $ws.Range(("F2:F{0}" -f $endRow))
+    $s1.Values  = $ws.Range(("G2:G{0}" -f $endRow))
+    try { $s1.Format.Line.ForeColor.RGB = $rgb; $s1.Format.Line.Weight = 2 } catch {}
+
+    $s2 = $c.SeriesCollection().NewSeries()
+    $s2.Name = 'threshold ' + $ThresholdMs + ' ms'
+    $s2.XValues = $ws.Range(("F2:F{0}" -f $endRow))
+    $s2.Values  = $ws.Range(("H2:H{0}" -f $endRow))
+    try { $s2.Format.Line.ForeColor.RGB = 255; $s2.Format.Line.Weight = 1.5; $s2.Format.Line.DashStyle = $msoLineDash } catch {}
+
+    try {
+      $v = $c.Axes($xlValue); $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
+      $x = $c.Axes($xlCategory); $x.CategoryType=$xlTimeScale; $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
+    } catch {}
+  }
+  else {
+    # fallback: raw A/B series to show trend even if within single hour
+    try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
+    $ch = $ws.ChartObjects().Add(300,10,900,320)
+    $ch.Name='chtRTT'
+    $c = $ch.Chart
+    $c.ChartType = $xlLine
+    $c.HasTitle  = $true
+    $c.ChartTitle.Text = 'RTT (raw) - ' + $h
+    $c.Legend.Position = $xlLegendBottom
+    try { $c.SeriesCollection().Delete() } catch {}
+
+    $rgb = Get-HostColor $h
+    $s1 = $c.SeriesCollection().NewSeries()
+    $s1.Name = $h
     $s1.XValues = $ws.Range("A2:A$lastRow")
     $s1.Values  = $ws.Range("B2:B$lastRow")
-    try {
-      $s1.Format.Line.ForeColor.RGB = $sColor
-      $s1.Format.Line.Weight = 2
-    } catch {}
+    try { $s1.Format.Line.ForeColor.RGB = $rgb; $s1.Format.Line.Weight = 2 } catch {}
 
-    # 閾値（赤・破線）
-    $s2 = $chC.SeriesCollection().NewSeries()
-    $s2.Name    = "threshold " + $ThresholdMs + "ms"
+    $s2 = $c.SeriesCollection().NewSeries()
+    $s2.Name = 'threshold ' + $ThresholdMs + ' ms'
     $s2.XValues = $ws.Range("A2:A$lastRow")
     $s2.Values  = $ws.Range("C2:C$lastRow")
-    try {
-      $s2.Format.Line.ForeColor.RGB = 255
-      $s2.Format.Line.Weight = 1.5
-      $s2.Format.Line.DashStyle = $msoLineDash
-    } catch {}
+    try { $s2.Format.Line.ForeColor.RGB = 255; $s2.Format.Line.Weight = 1.5; $s2.Format.Line.DashStyle = $msoLineDash } catch {}
 
-    # 軸：Y=0..300 / X=1時間
     try {
-      $valAx = $chC.Axes($xlValue)
-      $valAx.MinimumScale = 0
-      $valAx.MaximumScale = 300
-      $valAx.MajorUnit    = 50
-      $valAx.TickLabels.NumberFormat = "0.0"
+      $v = $c.Axes($xlValue); $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
+      $x = $c.Axes($xlCategory); $x.CategoryType=$xlTimeScale; $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
     } catch {}
-    try {
-      $catAx = $chC.Axes($xlCategory)
-      $catAx.CategoryType = $xlTimeScale
-      $catAx.MajorUnit    = 1/24
-      $catAx.TickLabels.NumberFormat = "mm/dd hh:mm"
-    } catch {}
-
-    $created += $sheetName
   }
 
-  # フィルタ解除
-  $loAll.AutoFilter.ShowAllData() | Out-Null 2>$null
+  $created += $sn
+  try { $null = $loAll.AutoFilter.ShowAllData() } catch {}
 }
 
-if(-not $created -or $created.Count -eq 0){
-  throw "target.txt のホストに一致するデータがありませんでした。"
-}
+if(-not $created -or $created.Count -eq 0){ throw 'No data matched hosts in target.txt' }
 
-# INDEX
+# index sheet
 try {
-  $wsIdx = $wb.Worksheets.Add()
-  $wsIdx.Name = "INDEX"
-  $wsIdx.Cells(1,1).Value2 = "Hosts"
-  $r = 2
-  foreach($sn in $created){
-    $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1), "", "'$sn'!A1", "", $sn) | Out-Null
-    $r++
-  }
+  $wsIdx = $wb.Worksheets.Add(); $wsIdx.Name='INDEX'
+  $wsIdx.Cells(1,1).Value2='Hosts'
+  $r=2; foreach($sn in $created){ $wsIdx.Hyperlinks.Add($wsIdx.Cells($r,1),'',"'$sn'!A1",'',$sn) | Out-Null; $r++ }
 } catch {}
 
-# AllData を右端へ
-try { $wb.Worksheets("AllData").Move($wb.Worksheets.Item($wb.Worksheets.Count)) } catch {}
+# move AllData to end
+try { $wb.Worksheets('AllData').Move($wb.Worksheets.Item($wb.Worksheets.Count)) } catch {}
 
-# 保存・終了
 $wb.SaveAs($Output)
 $wb.Close($true)
 $excel.Quit()
-[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb)    | Out-Null
+[System.Runtime.Interopservices.Marshal]::ReleaseComObject($wb) | Out-Null
 [System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
 [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 
-Write-Host "出力しました: $Output"
+Write-Host ('Output: ' + $Output)
