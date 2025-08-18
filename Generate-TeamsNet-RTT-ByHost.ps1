@@ -312,7 +312,7 @@ try{
     $rttsRaw  = New-Object System.Collections.Generic.List[double]
     foreach($ix in $rowsIdx){
       $t = $timeCol[$ix, $timeColIndex]
-      $r = $rttCol [$ix, $rttColIndex]
+      $r = $rttCol[$ix, $rttColIndex]
 
       # 時刻
       if($t -is [double]){ [double]$tNum=[double]$t }
