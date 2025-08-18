@@ -1,11 +1,11 @@
-
 <#
 Generate-TeamsNet-RTT-ByHost.ps1
-- Chart from A/B/C only (no F-H) to avoid axis mismatch
-- XY(Scatter with lines): X is true time (OADate), sorted ascending
-- BucketMinutes>=2 buckets -> hourly(avg), otherwise raw
-- Y axis: 0..300 ms (50 step), X axis: 1h ticks, threshold default 100 ms (red dashed)
-- Full error dump; Excel COM is always released
+- CSV(teams_net_quality.csv)のhost列から、target.txt に書いた IP or ホスト名に一致する行だけ抽出してグラフ化
+- 表記ゆれ許容: URL/ポート/括弧/末尾ドット除去、必要ならDNSで名前→IPv4も同一視
+- 1ホスト=1シート。A/B/C 列（timestamp/icmp_avg_ms/threshold）のみをグラフ化
+- XY(Scatter with lines)で X=時刻(OADate, 昇順)、Y=RTT。閾値線(既定100ms, 赤破線)
+- Y: 0..300(50刻み), X: 1時間刻み
+- 例外は詳細出力、成功/失敗に関わらず Excel COM を確実に解放
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -102,6 +102,33 @@ function Release-Com([object]$obj){
   }
 }
 
+# ★ host表記を正規化（URL→host、:port除去、(ip)抽出、末尾.除去、[]除去、Lower/Trim）
+function Normalize-Host([string]$s){
+  if(-not $s){ return '' }
+  $t = $s.Trim().Trim('"',"'").ToLowerInvariant()
+  if($t -match '\(([0-9]{1,3}(?:\.[0-9]{1,3}){3})\)'){ return $Matches[1] }
+  try{
+    $uri = $null
+    if([System.Uri]::TryCreate($t, [System.UriKind]::Absolute, [ref]$uri) -and $uri.Host){ $t = $uri.Host }
+  }catch{}
+  $t = $t.TrimEnd('.').Trim('[',']')
+  if($t -match '^(.+?):\d+$'){ $t = $Matches[1] }
+  return $t
+}
+# ★ 名前→IPv4の別名も追加（失敗は無視）
+function Expand-Aliases([string]$hostNorm){
+  $set = New-Object System.Collections.Generic.HashSet[string]
+  if([string]::IsNullOrWhiteSpace($hostNorm)){ return $set }
+  [void]$set.Add($hostNorm)
+  try{
+    if($hostNorm -notmatch '^\d{1,3}(\.\d{1,3}){3}$'){
+      $ips = [System.Net.Dns]::GetHostAddresses($hostNorm) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+      foreach($ip in $ips){ [void]$set.Add($ip.ToString().ToLowerInvariant()) }
+    }
+  }catch{}
+  return $set
+}
+
 # ---- Excel consts ----
 [int]$xlDelimited=1; [int]$xlYes=1; [int]$xlLegendBottom=-4107
 [int]$xlSrcRange=1; [int]$xlInsertDeleteCells=2; [int]$xlCellTypeVisible=12
@@ -119,7 +146,7 @@ if(-not $TargetsFile){
 }
 if(-not (Test-Path $TargetsFile)){ throw 'Targets file not found: ' + $TargetsFile }
 
-# PS5.1互換：素直に行単位で読む
+# targets 読み込み（コメント/空行スキップ）
 $targets = Get-Content -Encoding UTF8 $TargetsFile |
   ForEach-Object { $_.Trim() } |
   Where-Object { $_ -and (-not $_.StartsWith('#')) } |
@@ -143,7 +170,7 @@ try{
   $wb.Worksheets.Item(1).Name='AllData'
   $wsAll=$wb.Worksheets('AllData')
 
-  # import csv
+  # import csv -> AllData
   try{ foreach($qt in @($wsAll.QueryTables())){ $qt.Delete() } }catch{}
   try{ foreach($lo in @($wsAll.ListObjects())){ $lo.Unlist() } }catch{}
   $wsAll.Cells.Clear()
@@ -172,41 +199,60 @@ try{
   try{ $loAll.ListColumns('timestamp').DataBodyRange.NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
   try{ $loAll.ListColumns('icmp_avg_ms').DataBodyRange.NumberFormatLocal='0.0' }catch{}
 
+  # ★ 全行を一括で 2D 配列として取得（以降、PowerShell側で対象行を選別）
+  $hostCol = $loAll.ListColumns('host').DataBodyRange.Value2
+  $timeCol = $loAll.ListColumns('timestamp').DataBodyRange.Value2
+  $rttCol  = $loAll.ListColumns('icmp_avg_ms').DataBodyRange.Value2
+  if(-not ($hostCol -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$hostCol; $hostCol=$tmp }
+  if(-not ($timeCol -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$timeCol; $timeCol=$tmp }
+  if(-not ($rttCol  -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$rttCol;  $rttCol=$tmp }
+  [int]$rowCount = $hostCol.GetLength(0)
+
   $created=@()
   $ciInv=[System.Globalization.CultureInfo]::InvariantCulture
   $ciCur=[System.Globalization.CultureInfo]::CurrentCulture
 
   foreach($h in $targets){
-    # filter rows for this host
-    $null=$loAll.Range.AutoFilter($colHost,$h)
-    $timeVis=$loAll.ListColumns('timestamp').DataBodyRange.SpecialCells($xlCellTypeVisible)
-    $rttVis =$loAll.ListColumns('icmp_avg_ms').DataBodyRange.SpecialCells($xlCellTypeVisible)
+    # target を正規化 & 名前→IPv4 も別名として許容
+    $targetNorm = Normalize-Host $h
+    if([string]::IsNullOrWhiteSpace($targetNorm)){ continue }
+    $aliases = Expand-Aliases $targetNorm
 
-    # read visible -> arrays
-    $a=$timeVis.Value2; if(-not ($a -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$a; $a=$tmp }
-    $b=$rttVis.Value2;  if(-not ($b -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$b; $b=$tmp }
-    [int]$rows=$a.GetLength(0)
+    # マッチ行インデックスを収集（厳密一致 or 片包含フォールバック）
+    $rowsIdx = New-Object System.Collections.Generic.List[int]
+    for($i=0; $i -lt $rowCount; $i++){
+      $hn = Normalize-Host ([string]$hostCol[$i,0])
+      if([string]::IsNullOrWhiteSpace($hn)){ continue }
+      if($aliases.Contains($hn)){ $rowsIdx.Add($i); continue }
+      if($hn.Contains($targetNorm) -or $targetNorm.Contains($hn)){ $rowsIdx.Add($i); continue }
+    }
+    if($rowsIdx.Count -lt 1){ continue }  # このターゲットでは該当なし
 
-    $times=New-Object double[] $rows
-    $rtts =New-Object double[] $rows
-    for($i=0;$i -lt $rows;$i++){
-      $t=$a[$i,0]
+    # 対象行を数値に変換（時刻→OADate, RTT→Double）
+    $timesRaw = New-Object System.Collections.Generic.List[double]
+    $rttsRaw  = New-Object System.Collections.Generic.List[double]
+    foreach($ix in $rowsIdx){
+      $t = $timeCol[$ix,0]; $r = $rttCol[$ix,0]
       if($t -is [double]){ [double]$tNum=[double]$t } else {
         $tStr=[string]$t
         try{ $dt=[datetime]::Parse($tStr,$ciCur) }catch{ try{ $dt=[datetime]::Parse($tStr,$ciInv) }catch{ continue } }
         [double]$tNum=$dt.ToOADate()
       }
-      $v=$b[$i,0]
-      if($v -is [double]){ [double]$rNum=[double]$v } else {
+      if($r -is [double]){ [double]$rNum=[double]$r } else {
         $d=0.0
-        if([double]::TryParse([string]$v,[System.Globalization.NumberStyles]::Float,$ciInv,[ref]$d)){ [double]$rNum=$d }
-        elseif([double]::TryParse([string]$v,[System.Globalization.NumberStyles]::Float,$ciCur,[ref]$d)){ [double]$rNum=$d }
+        if([double]::TryParse([string]$r,[System.Globalization.NumberStyles]::Float,$ciInv,[ref]$d)){ [double]$rNum=$d }
+        elseif([double]::TryParse([string]$r,[System.Globalization.NumberStyles]::Float,$ciCur,[ref]$d)){ [double]$rNum=$d }
         else{ continue }
       }
-      $times[$i]=$tNum; $rtts[$i]=$rNum
+      $timesRaw.Add($tNum); $rttsRaw.Add($rNum)
     }
 
-    # aggregate if enough data -> xs/ys (both OADate/Double), always ascending by time
+    [int]$rows = $timesRaw.Count
+    if($rows -lt 2){ continue }
+    $times = $timesRaw.ToArray()
+    $rtts  = $rttsRaw.ToArray()
+
+    # 集計 or 生データ（ともに時刻昇順に）
     $xs=@(); $ys=@()
     $agg=@{}
     for($i=0;$i -lt $rows;$i++){
@@ -235,19 +281,17 @@ try{
       foreach($p in $pairs){ $xs += [double]$p.t; $ys += [double]$p.r }
     }
 
-    # create/clear host sheet
+    # シート作成/クリア
     $sn=Sanitize-SheetName $h
     try{ $ws=$wb.Worksheets.Item($sn); $ws.Cells.Clear(); try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{} }
     catch{ $ws=$wb.Worksheets.Add(); $ws.Name=$sn }
 
-    # headers for charting series
+    # A/B/Cへ書き出し（A:timestamp/OADate, B:RTT, C:threshold）
+    [int]$n=[int]$xs.Count
+    if($n -lt 2){ continue }
     $ws.Cells(1,1).Value2='timestamp'
     $ws.Cells(1,2).Value2='icmp_avg_ms'
     $ws.Cells(1,3).Value2='threshold_ms'
-
-    # write A/B/C only
-    [int]$n=[int]$xs.Count
-    if($n -lt 2){ try{ $null=$loAll.AutoFilter.ShowAllData() }catch{}; continue }
     Write-Column2D $ws 'A2' $xs
     Write-Column2D $ws 'B2' $ys
     Write-Column2D $ws 'C2' (New-RepeatedArray -value ([double]$ThresholdMs) -count $n)
@@ -255,11 +299,10 @@ try{
     try{ $ws.Range(("B2:B{0}" -f (1+$n))).NumberFormatLocal='0.0' }catch{}
     $null=$ws.Columns("A:C").AutoFit()
 
-    # chart (XY) from A/B/C
+    # グラフ（XY）
     try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{}
     $ch=$ws.ChartObjects().Add(300,10,900,320)
     $c=$ch.Chart; $c.ChartType=$xlXYScatterLinesNoMarkers; $c.HasTitle=$true
-    # PS5.1互換：if式を使わずに事前に変数を設定
     $titlePrefix = 'RTT (raw) - '
     if ($useBuckets) { $titlePrefix = 'RTT hourly avg (icmp_avg_ms) - ' }
     $c.ChartTitle.Text = ($titlePrefix + $h)
@@ -267,22 +310,18 @@ try{
     try{ $c.SeriesCollection().Delete() }catch{}
     [int]$endRow=1+[int]$n
     $rgb=Get-HostColor $h
-
     $s1=$c.SeriesCollection().NewSeries(); $s1.Name=$h
     $s1.XValues=$ws.Range(("A2:A{0}" -f $endRow)); $s1.Values=$ws.Range(("B2:B{0}" -f $endRow))
     try{ $s1.Format.Line.ForeColor.RGB=$rgb; $s1.Format.Line.Weight=2 }catch{}
-
     $s2=$c.SeriesCollection().NewSeries(); $s2.Name=('threshold ' + [int]$ThresholdMs + ' ms')
     $s2.XValues=$ws.Range(("A2:A{0}" -f $endRow)); $s2.Values=$ws.Range(("C2:C{0}" -f $endRow))
     try{ $s2.Format.Line.ForeColor.RGB=255; $s2.Format.Line.Weight=1.5; $s2.Format.Line.DashStyle=$msoLineDash }catch{}
-
     try{
       $v=$c.Axes($xlValue);    $v.MinimumScale=[double]0; $v.MaximumScale=[double]300; $v.MajorUnit=[double]50; $v.TickLabels.NumberFormat='0.0'
       $x=$c.Axes($xlCategory); $x.MajorUnit=[double](1.0/24.0);                             $x.TickLabels.NumberFormat='mm/dd hh:mm'
     }catch{}
 
     $created += $sn
-    try{ $null=$loAll.AutoFilter.ShowAllData() }catch{}
     $ws=$null
   }
 
