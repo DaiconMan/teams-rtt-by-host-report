@@ -1,11 +1,10 @@
 <#
 Generate-TeamsNet-RTT-ByHost.ps1
-- CSV(teams_net_quality.csv)のhost列から、target.txt に書いた IP or ホスト名に一致する行だけ抽出してグラフ化
-- 表記ゆれ許容: URL/ポート/括弧/末尾ドット除去、必要ならDNSで名前→IPv4も同一視
-- 1ホスト=1シート。A/B/C 列（timestamp/icmp_avg_ms/threshold）のみをグラフ化
-- XY(Scatter with lines)で X=時刻(OADate, 昇順)、Y=RTT。閾値線(既定100ms, 赤破線)
-- Y: 0..300(50刻み), X: 1時間刻み
-- 例外は詳細出力、成功/失敗に関わらず Excel COM を確実に解放
+- target.txt の IP/Host に一致する CSV 行のみ抽出して XY(時系列) グラフ化
+- 表記ゆれ対応: URL/ポート/括弧/末尾ドット/[] を除去し正規化。必要に応じ DNS で名前→IPv4 も同一視
+- A/B/C 列のみ参照 (A: timestamp OADate, B: icmp_avg_ms, C: threshold)
+- 一致がゼロの場合は DEBUG シートを作って保存後にエラー終了
+- PS 5.1 互換、Excel COM は必ず解放
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass `
@@ -102,31 +101,67 @@ function Release-Com([object]$obj){
   }
 }
 
-# ★ host表記を正規化（URL→host、:port除去、(ip)抽出、末尾.除去、[]除去、Lower/Trim）
+# 正規化: URL→host、(ip)抽出、末尾.除去、[]除去、:port除去(IPv6は残す)、Lower/Trim
 function Normalize-Host([string]$s){
   if(-not $s){ return '' }
   $t = $s.Trim().Trim('"',"'").ToLowerInvariant()
+
+  # "name (ip)" or "name [ip]" の ip を優先
   if($t -match '\(([0-9]{1,3}(?:\.[0-9]{1,3}){3})\)'){ return $Matches[1] }
+  if($t -match '\[([0-9a-f:]+)\]'){ return $Matches[1] }
+
+  # URL の場合はホスト部
   try{
     $uri = $null
-    if([System.Uri]::TryCreate($t, [System.UriKind]::Absolute, [ref]$uri) -and $uri.Host){ $t = $uri.Host }
+    if([System.Uri]::TryCreate($t, [System.UriKind]::Absolute, [ref]$uri) -and $uri.Host){ $t = $uri.Host.ToLowerInvariant() }
   }catch{}
+
   $t = $t.TrimEnd('.').Trim('[',']')
-  if($t -match '^(.+?):\d+$'){ $t = $Matches[1] }
+
+  # IPv6 リテラルはそのまま。IPv4/ホスト名 + :port の場合のみポート除去
+  $isIPv6 = [System.Net.IPAddress]::TryParse($t, [ref]([ref]$null).Value) -and ($t.Contains(':'))
+  if(-not $isIPv6){
+    if($t -match '^(.+?):(\d+)$'){ $t = $Matches[1] }
+  }
+
+  # スペース区切りで IP っぽいトークンがあれば拾う（例: "host 52.113.87.17"）
+  if($t -match '(^|\s)(\d{1,3}(?:\.\d{1,3}){3})(\s|$)'){ return $Matches[2] }
+
   return $t
 }
-# ★ 名前→IPv4の別名も追加（失敗は無視）
+
+# 名前→IPv4/IPv6 の別名も許容（失敗は無視）
 function Expand-Aliases([string]$hostNorm){
   $set = New-Object System.Collections.Generic.HashSet[string]
   if([string]::IsNullOrWhiteSpace($hostNorm)){ return $set }
   [void]$set.Add($hostNorm)
   try{
-    if($hostNorm -notmatch '^\d{1,3}(\.\d{1,3}){3}$'){
-      $ips = [System.Net.Dns]::GetHostAddresses($hostNorm) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+    # 名前なら解決して両系(IP4/6)を加える
+    if(-not ([System.Net.IPAddress]::TryParse($hostNorm, [ref]([ref]$null).Value))){
+      $ips = [System.Net.Dns]::GetHostAddresses($hostNorm)
       foreach($ip in $ips){ [void]$set.Add($ip.ToString().ToLowerInvariant()) }
     }
   }catch{}
   return $set
+}
+
+# 列探索（ヘッダー表記ゆれ対策）
+function Find-ColumnIndex($listObject, [string[]]$candidates){
+  # 完全一致(小文字) → 部分一致の順
+  $cols = @($listObject.ListColumns)
+  foreach($cand in $candidates){
+    foreach($col in $cols){
+      $name = [string]$col.Name
+      if($name -and ($name.Trim().ToLowerInvariant() -eq $cand)){ return $col.Index }
+    }
+  }
+  foreach($cand in $candidates){
+    foreach($col in $cols){
+      $name = [string]$col.Name
+      if($name -and ($name.Trim().ToLowerInvariant() -like "*$cand*")){ return $col.Index }
+    }
+  }
+  return $null
 }
 
 # ---- Excel consts ----
@@ -138,22 +173,26 @@ function Expand-Aliases([string]$hostNorm){
 
 # ---- inputs ----
 $csv = Join-Path $InputDir 'teams_net_quality.csv'
+Write-Host "[INFO] CSV : $csv"
 if(-not (Test-Path $csv)){ throw 'CSV not found: ' + $csv }
 
 if(-not $TargetsFile){
   $TargetsFile = Join-Path $PSScriptRoot 'target.txt'
   if(-not (Test-Path $TargetsFile)){ $TargetsFile = Join-Path $InputDir 'target.txt' }
 }
+Write-Host "[INFO] TGT : $TargetsFile"
 if(-not (Test-Path $TargetsFile)){ throw 'Targets file not found: ' + $TargetsFile }
 
-# targets 読み込み（コメント/空行スキップ）
+# targets 読み込み
 $targets = Get-Content -Encoding UTF8 $TargetsFile |
   ForEach-Object { $_.Trim() } |
   Where-Object { $_ -and (-not $_.StartsWith('#')) } |
   Select-Object -Unique
 if(-not $targets -or $targets.Count -eq 0){ throw 'No valid hosts in target.txt' }
+Write-Host "[INFO] Targets:"
+$targets | ForEach-Object { Write-Host "  - $_" }
 
-# normalize bucket
+# bucket
 $BucketMinutes=[int]$BucketMinutes
 if($BucketMinutes -lt 1){ $BucketMinutes=60 }
 [double]$frac = [double]$BucketMinutes / 1440.0
@@ -191,34 +230,45 @@ try{
   $loAll.Name='tblAll'
   $null=$wsAll.Columns.AutoFit()
 
-  function Try-GetColIndex($listObject,[string]$col){ try{ return $listObject.ListColumns($col).Index }catch{ return $null } }
-  $colHost=Try-GetColIndex $loAll 'host'
-  $colTime=Try-GetColIndex $loAll 'timestamp'
-  $colRtt =Try-GetColIndex $loAll 'icmp_avg_ms'
-  if($null -eq $colHost -or $null -eq $colTime -or $null -eq $colRtt){ throw 'Required columns missing: host, timestamp, icmp_avg_ms' }
-  try{ $loAll.ListColumns('timestamp').DataBodyRange.NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
-  try{ $loAll.ListColumns('icmp_avg_ms').DataBodyRange.NumberFormatLocal='0.0' }catch{}
+  # 列特定（表記ゆれ対応）
+  $colHost=Find-ColumnIndex $loAll @('host','hostname','target','dst_host','dest','remote_host')
+  $colTime=Find-ColumnIndex $loAll @('timestamp','time','datetime','date')
+  $colRtt =Find-ColumnIndex $loAll @('icmp_avg_ms','rtt_ms','avg_rtt','avg_rtt_ms','icmp_avg','icmp_rtt_ms')
+  if($null -eq $colHost -or $null -eq $colTime -or $null -eq $colRtt){
+    $names = (@($loAll.ListColumns) | ForEach-Object { $_.Name }) -join ', '
+    throw ("Required columns missing: host/timestamp/icmp_avg_ms (found: {0})" -f $names)
+  }
+  try{ $loAll.ListColumns($colTime).DataBodyRange.NumberFormatLocal='yyyy/mm/dd hh:mm' }catch{}
+  try{ $loAll.ListColumns($colRtt ).DataBodyRange.NumberFormatLocal='0.0' }catch{}
 
-  # ★ 全行を一括で 2D 配列として取得（以降、PowerShell側で対象行を選別）
-  $hostCol = $loAll.ListColumns('host').DataBodyRange.Value2
-  $timeCol = $loAll.ListColumns('timestamp').DataBodyRange.Value2
-  $rttCol  = $loAll.ListColumns('icmp_avg_ms').DataBodyRange.Value2
+  # 全行を一括取得
+  $hostCol = $loAll.ListColumns($colHost).DataBodyRange.Value2
+  $timeCol = $loAll.ListColumns($colTime).DataBodyRange.Value2
+  $rttCol  = $loAll.ListColumns($colRtt ).DataBodyRange.Value2
   if(-not ($hostCol -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$hostCol; $hostCol=$tmp }
   if(-not ($timeCol -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$timeCol; $timeCol=$tmp }
   if(-not ($rttCol  -is [Array])){ $tmp=New-Object 'object[,]' 1,1; $tmp[0,0]=$rttCol;  $rttCol=$tmp }
   [int]$rowCount = $hostCol.GetLength(0)
+
+  # DEBUG 用: CSV 側の正規化 host の分布
+  $csvNorm = @{}
+  for($i=0;$i -lt $rowCount;$i++){
+    $raw = [string]$hostCol[$i,0]
+    $norm = Normalize-Host $raw
+    if(-not $csvNorm.ContainsKey($norm)){ $csvNorm[$norm] = @{count=0; sample=$raw} }
+    $csvNorm[$norm].count++
+  }
 
   $created=@()
   $ciInv=[System.Globalization.CultureInfo]::InvariantCulture
   $ciCur=[System.Globalization.CultureInfo]::CurrentCulture
 
   foreach($h in $targets){
-    # target を正規化 & 名前→IPv4 も別名として許容
     $targetNorm = Normalize-Host $h
     if([string]::IsNullOrWhiteSpace($targetNorm)){ continue }
     $aliases = Expand-Aliases $targetNorm
 
-    # マッチ行インデックスを収集（厳密一致 or 片包含フォールバック）
+    # マッチ行抽出
     $rowsIdx = New-Object System.Collections.Generic.List[int]
     for($i=0; $i -lt $rowCount; $i++){
       $hn = Normalize-Host ([string]$hostCol[$i,0])
@@ -226,9 +276,10 @@ try{
       if($aliases.Contains($hn)){ $rowsIdx.Add($i); continue }
       if($hn.Contains($targetNorm) -or $targetNorm.Contains($hn)){ $rowsIdx.Add($i); continue }
     }
-    if($rowsIdx.Count -lt 1){ continue }  # このターゲットでは該当なし
+    Write-Host ("[MATCH] target='{0}' norm='{1}' aliases=[{2}] -> rows={3}" -f $h, $targetNorm, ([string]::Join(',', $aliases)), $rowsIdx.Count)
+    if($rowsIdx.Count -lt 2){ continue }
 
-    # 対象行を数値に変換（時刻→OADate, RTT→Double）
+    # 数値化
     $timesRaw = New-Object System.Collections.Generic.List[double]
     $rttsRaw  = New-Object System.Collections.Generic.List[double]
     foreach($ix in $rowsIdx){
@@ -247,15 +298,16 @@ try{
       $timesRaw.Add($tNum); $rttsRaw.Add($rNum)
     }
 
-    [int]$rows = $timesRaw.Count
-    if($rows -lt 2){ continue }
+    [int]$rowsM = $timesRaw.Count
+    if($rowsM -lt 2){ continue }
     $times = $timesRaw.ToArray()
     $rtts  = $rttsRaw.ToArray()
 
-    # 集計 or 生データ（ともに時刻昇順に）
-    $xs=@(); $ys=@()
+    # 集計 or 生データ（昇順）
+    $xs=@(); $ys=@{}
+    $ys=@()
     $agg=@{}
-    for($i=0;$i -lt $rows;$i++){
+    for($i=0;$i -lt $rowsM;$i++){
       [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
       if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
       [double]$bkt=[math]::Floor($t / ([double]$frac)) * ([double]$frac)
@@ -272,7 +324,7 @@ try{
       }
     } else {
       $pairs=@()
-      for($i=0;$i -lt $rows;$i++){
+      for($i=0;$i -lt $rowsM;$i++){
         [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
         if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
         $pairs += [pscustomobject]@{ t=$t; r=$r }
@@ -281,12 +333,12 @@ try{
       foreach($p in $pairs){ $xs += [double]$p.t; $ys += [double]$p.r }
     }
 
-    # シート作成/クリア
+    # シート作成
     $sn=Sanitize-SheetName $h
     try{ $ws=$wb.Worksheets.Item($sn); $ws.Cells.Clear(); try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{} }
     catch{ $ws=$wb.Worksheets.Add(); $ws.Name=$sn }
 
-    # A/B/Cへ書き出し（A:timestamp/OADate, B:RTT, C:threshold）
+    # A/B/C 出力
     [int]$n=[int]$xs.Count
     if($n -lt 2){ continue }
     $ws.Cells(1,1).Value2='timestamp'
@@ -299,7 +351,7 @@ try{
     try{ $ws.Range(("B2:B{0}" -f (1+$n))).NumberFormatLocal='0.0' }catch{}
     $null=$ws.Columns("A:C").AutoFit()
 
-    # グラフ（XY）
+    # グラフ
     try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{}
     $ch=$ws.ChartObjects().Add(300,10,900,320)
     $c=$ch.Chart; $c.ChartType=$xlXYScatterLinesNoMarkers; $c.HasTitle=$true
@@ -325,7 +377,27 @@ try{
     $ws=$null
   }
 
-  if(-not $created -or $created.Count -eq 0){ throw 'No data matched hosts in target.txt' }
+  if(-not $created -or $created.Count -eq 0){
+    # DEBUG シートを書き出してからエラー終了
+    try{
+      $wsDbg = $wb.Worksheets.Add(); $wsDbg.Name='DEBUG'
+      $wsDbg.Cells(1,1).Value2='csv_host_sample'
+      $wsDbg.Cells(1,2).Value2='normalized'
+      $wsDbg.Cells(1,3).Value2='count'
+      $r=2
+      $items = $csvNorm.GetEnumerator() | Sort-Object { $_.Value.count } -Descending
+      foreach($it in $items){
+        $wsDbg.Cells($r,1).Value2 = $it.Value.sample
+        $wsDbg.Cells($r,2).Value2 = $it.Key
+        $wsDbg.Cells($r,3).Value2 = [int]$it.Value.count
+        $r++
+      }
+      $wsDbg.Columns.AutoFit() | Out-Null
+      $wb.SaveAs($Output)
+      Write-Warning ("No data matched hosts in target.txt. DEBUG sheet written to: {0}" -f $Output)
+    }catch{}
+    throw 'No data matched hosts in target.txt'
+  }
 
   try{
     $wsIdx=$wb.Worksheets.Add(); $wsIdx.Name='INDEX'
