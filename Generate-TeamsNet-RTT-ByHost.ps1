@@ -1,12 +1,11 @@
 <#
 Generate-TeamsNet-RTT-ByHost.ps1
-- Chart from A/B/C only (no F-H table) to avoid axis mismatch
-- XY(Scatter with lines): X is true time (OADate), always sorted ascending
-- BucketMinutes>=2 buckets -> hourly(avg)で集計、1未満なら生データ
-- Y axis: 0..300 ms, X axis: hourly ticks, threshold default 100 ms (red dashed)
-- Full error dump; Excel COM is always released (success/failure)
+- Chart from A/B/C only (no F-H) to avoid axis mismatch
+- XY(Scatter with lines): X is true time (OADate), sorted ascending
+- BucketMinutes>=2 buckets -> hourly(avg), otherwise raw
+- Y axis: 0..300 ms (50 step), X axis: 1h ticks, threshold default 100 ms (red dashed)
+- Full error dump; Excel COM is always released
 
-Save as: UTF-8 with BOM, CRLF
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass `
     -File .\Generate-TeamsNet-RTT-ByHost.ps1 `
@@ -30,7 +29,8 @@ $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues['*:ErrorAction'] = 'Stop'
 $global:ErrorView = 'NormalView'
 
-function Format-ErrorRecord { param([System.Management.Automation.ErrorRecord]$Err)
+function Format-ErrorRecord {
+  param([System.Management.Automation.ErrorRecord]$Err)
   $ex = $Err.Exception
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add('ERROR -----')
@@ -118,10 +118,11 @@ if(-not $TargetsFile){
 }
 if(-not (Test-Path $TargetsFile)){ throw 'Targets file not found: ' + $TargetsFile }
 
-$targets = Get-Content -Raw -Encoding UTF8 $TargetsFile |
-  ForEach-Object { $_ -split "`r?`n" } |
-  Where-Object { $_ -and (-not $_.Trim().StartsWith('#')) } |
-  ForEach-Object { $_.Trim() } | Select-Object -Unique
+# ※ Windows PowerShell 互換のため -Raw/-split 正規表現は使わず素直に行取得
+$targets = Get-Content -Encoding UTF8 $TargetsFile |
+  ForEach-Object { $_.Trim() } |
+  Where-Object { $_ -and (-not $_.StartsWith('#')) } |
+  Select-Object -Unique
 if(-not $targets -or $targets.Count -eq 0){ throw 'No valid hosts in target.txt' }
 
 # normalize bucket
@@ -210,7 +211,7 @@ try{
     for($i=0;$i -lt $rows;$i++){
       [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
       if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
-      [double]$bkt=[math]::Floor($t / $frac) * $frac
+      [double]$bkt=[math]::Floor($t / ([double]$frac)) * ([double]$frac)
       if($agg[$bkt]){ $agg[$bkt].sum=[double]($agg[$bkt].sum+$r); $agg[$bkt].cnt=[int]($agg[$bkt].cnt+1) }
       else{ $agg[$bkt]=@{sum=[double]$r; cnt=[int]1} }
     }
@@ -243,7 +244,7 @@ try{
     $ws.Cells(1,2).Value2='icmp_avg_ms'
     $ws.Cells(1,3).Value2='threshold_ms'
 
-    # write A/B/C only (no F-H)
+    # write A/B/C only
     [int]$n=[int]$xs.Count
     if($n -lt 2){ try{ $null=$loAll.AutoFilter.ShowAllData() }catch{}; continue }
     Write-Column2D $ws 'A2' $xs
@@ -257,7 +258,8 @@ try{
     try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{}
     $ch=$ws.ChartObjects().Add(300,10,900,320)
     $c=$ch.Chart; $c.ChartType=$xlXYScatterLinesNoMarkers; $c.HasTitle=$true
-    $c.ChartTitle.Text = ($useBuckets ? 'RTT hourly avg (icmp_avg_ms) - ' : 'RTT (raw) - ') + $h
+    $titlePrefix = if($useBuckets){ 'RTT hourly avg (icmp_avg_ms) - ' } else { 'RTT (raw) - ' }  # ← 三項演算子の代替
+    $c.ChartTitle.Text = $titlePrefix + $h
     $c.Legend.Position=$xlLegendBottom
     try{ $c.SeriesCollection().Delete() }catch{}
     [int]$endRow=1+[int]$n
