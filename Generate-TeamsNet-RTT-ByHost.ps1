@@ -300,8 +300,8 @@ try{
       # 2) 正規化後の片包含
       if($hn.Contains($targetNorm) -or $targetNorm.Contains($hn)){ $rowsIdx.Add($i); continue }
 
-      # 3) 生文字列の片包含（最終フォールバック）
-      $rawL = ($raw ?? '').Trim().ToLowerInvariant()
+      # 3) 生文字列の片包含（最終フォールバック） ※PS5.1対応（?? を使わない）
+      $rawL = ('' + $raw).Trim().ToLowerInvariant()
       if($rawL.Contains($targetNorm)){ $rowsIdx.Add($i); continue }
     }
     Write-Host ("[MATCH] target='{0}' norm='{1}' aliases=[{2}] -> rows={3}" -f $h, $targetNorm, ([string]::Join(',', $aliases)), $rowsIdx.Count)
