@@ -3,6 +3,7 @@ Generate-TeamsNet-RTT-ByHost.ps1
 
 目的:
 - CSV(teams_net_quality.csv)の host 列から、target.txt に書かれた IP/ホストに合致する行のみ抽出し、時系列グラフを作成
+- target.txt で「IP, ラベル」のカンマ区切りをサポート（ラベルはシート名・グラフ表示に使用）
 - 表記ゆれ対策: URL/ポート/括弧/末尾ドット/[] の除去による正規化 + 必要に応じ DNS で名前→IP の別名も許容
 - 1ホスト=1シート。グラフは A/B/C 列のみをソース (A: timestamp(OADate), B: icmp_avg_ms, C: threshold)
 - XY(散布・折れ線, マーカー付) で X=時刻(数値), Y=RTT。Y: 0..300ms(50刻み), X: 1時間刻み。閾値線(既定100ms, 赤破線)
@@ -104,26 +105,34 @@ function Release-Com([object]$obj){
   }
 }
 
+# 逆引き（失敗はnull）
+function Try-ReverseDns([string]$ip){
+  try{
+    $addr=[System.Net.IPAddress]::Parse($ip)
+    $he=[System.Net.Dns]::GetHostEntry($addr)
+    if($he.HostName){ return $he.HostName.ToLowerInvariant() }
+  }catch{}
+  return $null
+}
+
+# シート存在チェック
+function Has-Sheet($wb,[string]$name){
+  try{ $null=$wb.Worksheets.Item($name); return $true }catch{ return $false }
+}
+
 # 正規化: URL→host、(ip)抽出、末尾.除去、[]除去、:port除去、lower/trim
 function Normalize-Host([string]$s){
   if(-not $s){ return '' }
   $t = $s.Trim().Trim('"',"'").ToLowerInvariant()
-
-  # "name (ip)" / "name [ip]" の ip を優先
   if($t -match '\(([0-9]{1,3}(?:\.[0-9]{1,3}){3})\)'){ return $Matches[1] }
   if($t -match '\[([0-9a-f:]+)\]'){ return $Matches[1] }
-
-  # URL の場合はホスト部
   try{
     $uri = $null
     if([System.Uri]::TryCreate($t, [System.UriKind]::Absolute, [ref]$uri) -and $uri.Host){
       $t = $uri.Host.ToLowerInvariant()
     }
   }catch{}
-
   $t = $t.TrimEnd('.').Trim('[',']')
-
-  # IPv6リテラル以外の :port を除去
   $isIPv6 = $false
   try{
     $ipRef = $null
@@ -132,10 +141,7 @@ function Normalize-Host([string]$s){
   if(-not $isIPv6){
     if($t -match '^(.+?):(\d+)$'){ $t = $Matches[1] }
   }
-
-  # 文字列中に IPv4 らしきトークンがあればそれを返す（例: "host 52.113.87.17"）
   if($t -match '(^|\s)(\d{1,3}(?:\.\d{1,3}){3})(\s|$)'){ return $Matches[2] }
-
   return $t
 }
 
@@ -157,14 +163,12 @@ function Expand-Aliases([string]$hostNorm){
 # 列探索（ヘッダー表記ゆれ対策）
 function Find-ColumnIndex($listObject, [string[]]$candidates){
   $cols = @($listObject.ListColumns)
-  # 完全一致
   foreach($cand in $candidates){
     foreach($col in $cols){
       $name = [string]$col.Name
       if($name -and ($name.Trim().ToLowerInvariant() -eq $cand)){ return $col.Index }
     }
   }
-  # 部分一致
   foreach($cand in $candidates){
     foreach($col in $cols){
       $name = [string]$col.Name
@@ -174,11 +178,28 @@ function Find-ColumnIndex($listObject, [string[]]$candidates){
   return $null
 }
 
+# target.txt パーサ: 「キー, ラベル」形式（ラベル省略可）
+function Parse-Targets([string]$file){
+  $list = New-Object System.Collections.Generic.List[object]
+  $lines = Get-Content -Encoding UTF8 $file
+  foreach($line in $lines){
+    $t = ($line -replace '^\ufeff','').Trim()
+    if(-not $t -or $t.StartsWith('#')){ continue }
+    $parts = $t.Split(@(','),2,[System.StringSplitOptions]::None)
+    $key = $parts[0].Trim()
+    $label = if($parts.Count -ge 2){ $parts[1].Trim() } else { '' }
+    if($key){
+      $list.Add([pscustomobject]@{ Raw=$key; Label=$label })
+    }
+  }
+  return $list
+}
+
 # ---- Excel consts ----
 [int]$xlDelimited=1; [int]$xlYes=1; [int]$xlLegendBottom=-4107
 [int]$xlSrcRange=1; [int]$xlInsertDeleteCells=2
 [int]$xlUp=-4162; [int]$xlCategory=1; [int]$xlValue=2
-[int]$xlXYScatterLines = 74           # マーカー付き散布折れ線
+[int]$xlXYScatterLines = 74
 [int]$msoLineDash=4
 
 # ---- inputs ----
@@ -193,13 +214,11 @@ if(-not $TargetsFile){
 Write-Host "[INFO] TGT : $TargetsFile"
 if(-not (Test-Path $TargetsFile)){ throw 'Targets file not found: ' + $TargetsFile }
 
-# targets 読み込み
-$targets = Get-Content -Encoding UTF8 $TargetsFile |
-  ForEach-Object { $_.Trim() } |
-  Where-Object { $_ -and (-not $_.StartsWith('#')) } |
-  Select-Object -Unique
-if(-not $targets -or $targets.Count -eq 0){ throw 'No valid hosts in target.txt' }
-Write-Host "[INFO] Targets:"; $targets | ForEach-Object { Write-Host "  - $_" }
+# targets 読み込み（キー, ラベル）
+$targetItems = Parse-Targets $TargetsFile
+if(-not $targetItems -or $targetItems.Count -eq 0){ throw 'No valid entries in target.txt' }
+Write-Host "[INFO] Targets:"
+$targetItems | ForEach-Object { Write-Host ("  - key='{0}' label='{1}'" -f $_.Raw, $_.Label) }
 
 # バケット幅（日単位）
 $BucketMinutes=[int]$BucketMinutes
@@ -282,30 +301,51 @@ try{
   $ciInv=[System.Globalization.CultureInfo]::InvariantCulture
   $ciCur=[System.Globalization.CultureInfo]::CurrentCulture
 
-  foreach($h in $targets){
+  foreach($item in $targetItems){
+    $h = $item.Raw
+    $labelHint = $item.Label
     $targetNorm = Normalize-Host $h
     if([string]::IsNullOrWhiteSpace($targetNorm)){ continue }
     $aliases = Expand-Aliases $targetNorm
 
-    # ---- マッチ行抽出（1始まり + フォールバック強化）----
+    # ---- マッチ行抽出 ----
     $rowsIdx = New-Object System.Collections.Generic.List[int]
     for($i=$Rlo; $i -le $Rhi; $i++){
       $raw = [string]$hostCol[$i, $hostColIndex]
       $hn  = Normalize-Host $raw
       if([string]::IsNullOrWhiteSpace($hn)){ continue }
-
-      # 1) 厳密一致（別名も含む）
       if($aliases.Contains($hn)){ $rowsIdx.Add($i); continue }
-
-      # 2) 正規化後の片包含
       if($hn.Contains($targetNorm) -or $targetNorm.Contains($hn)){ $rowsIdx.Add($i); continue }
-
-      # 3) 生文字列の片包含（最終フォールバック） ※PS5.1対応（?? を使わない）
       $rawL = ('' + $raw).Trim().ToLowerInvariant()
       if($rawL.Contains($targetNorm)){ $rowsIdx.Add($i); continue }
     }
-    Write-Host ("[MATCH] target='{0}' norm='{1}' aliases=[{2}] -> rows={3}" -f $h, $targetNorm, ([string]::Join(',', $aliases)), $rowsIdx.Count)
+    Write-Host ("[MATCH] key='{0}' norm='{1}' aliases=[{2}] -> rows={3}" -f $h, $targetNorm, ([string]::Join(',', $aliases)), $rowsIdx.Count)
     if($rowsIdx.Count -lt 1){ continue }
+
+    # ---- ラベル（表示名）決定 ----
+    $label = $labelHint
+    if([string]::IsNullOrWhiteSpace($label)){
+      # keyがIPなら逆引き→無ければCSV最頻の名前部分、keyがホストならそれを使う
+      if($targetNorm -match '^\d{1,3}(?:\.\d{1,3}){3}$'){
+        $rdns = Try-ReverseDns $targetNorm
+        if($rdns){ $label = $rdns } else {
+          $counts=@{}
+          foreach($ix in $rowsIdx){
+            $raw = ('' + $hostCol[$ix, $hostColIndex])
+            if(-not $counts.ContainsKey($raw)){ $counts[$raw]=0 }
+            $counts[$raw]++
+          }
+          if($counts.Count -gt 0){
+            $topRaw = ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+            $namePart = ('' + $topRaw) -replace '\s*\(.*$',''
+            if($namePart){ $label = $namePart.ToLowerInvariant() }
+          }
+          if([string]::IsNullOrWhiteSpace($label)){ $label = $h }
+        }
+      } else {
+        $label = $h
+      }
+    }
 
     # ---- 数値化（時刻→OADate, RTT→Double）----
     $timesRaw = New-Object System.Collections.Generic.List[double]
@@ -313,16 +353,12 @@ try{
     foreach($ix in $rowsIdx){
       $t = $timeCol[$ix, $timeColIndex]
       $r = $rttCol[$ix, $rttColIndex]
-
-      # 時刻
       if($t -is [double]){ [double]$tNum=[double]$t }
       else{
         $tStr=[string]$t
         try{ $dt=[datetime]::Parse($tStr,$ciCur) }catch{ try{ $dt=[datetime]::Parse($tStr,$ciInv) }catch{ continue } }
         [double]$tNum=$dt.ToOADate()
       }
-
-      # RTT
       if($r -is [double]){ [double]$rNum=[double]$r }
       else{
         $d=0.0
@@ -330,7 +366,6 @@ try{
         elseif([double]::TryParse([string]$r,[System.Globalization.NumberStyles]::Float,$ciCur,[ref]$d)){ [double]$rNum=$d }
         else{ continue }
       }
-
       $timesRaw.Add($tNum); $rttsRaw.Add($rNum)
     }
 
@@ -342,8 +377,8 @@ try{
     # ---- 集計 or 生データ（昇順）----
     $xs=@(); $ys=@()
     $agg=@{}
-    for($i=0;$i -lt $rowsM;$i++){
-      [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
+    for($i2=0;$i2 -lt $rowsM;$i2++){
+      [double]$t=[double]$times[$i2]; [double]$r=[double]$rtts[$i2]
       if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
       [double]$bkt=[math]::Floor($t / ([double]$frac)) * ([double]$frac)
       if($agg[$bkt]){ $agg[$bkt].sum=[double]($agg[$bkt].sum+$r); $agg[$bkt].cnt=[int]($agg[$bkt].cnt+1) }
@@ -359,8 +394,8 @@ try{
       }
     } else {
       $pairs=@()
-      for($i=0;$i -lt $rowsM;$i++){
-        [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
+      for($i3=0;$i3 -lt $rowsM;$i3++){
+        [double]$t=[double]$times[$i3]; [double]$r=[double]$rtts[$i3]
         if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
         $pairs += [pscustomobject]@{ t=$t; r=$r }
       }
@@ -372,9 +407,13 @@ try{
     [int]$n=[int]$xs.Count
     if($n -lt 1){ continue }
 
-    $sn=Sanitize-SheetName $h
-    try{ $ws=$wb.Worksheets.Item($sn); $ws.Cells.Clear(); try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{} }
-    catch{ $ws=$wb.Worksheets.Add(); $ws.Name=$sn }
+    $snBase = Sanitize-SheetName $label
+    $sn = $snBase
+    $suffix = 2
+    while(Has-Sheet $wb $sn){ $sn = Sanitize-SheetName ($snBase + "_" + $suffix); $suffix++ }
+
+    try{ $ws=$wb.Worksheets.Add(); $ws.Name=$sn }
+    catch{ $ws=$wb.Worksheets.Add() }
 
     # A/B/C へ書き出し
     $ws.Cells(1,1).Value2='timestamp'
@@ -393,17 +432,17 @@ try{
     $c=$ch.Chart; $c.ChartType=$xlXYScatterLines; $c.HasTitle=$true
     $titlePrefix = 'RTT (raw) - '
     if ($useBuckets) { $titlePrefix = 'RTT hourly avg (icmp_avg_ms) - ' }
-    $c.ChartTitle.Text = ($titlePrefix + $h)
+    $c.ChartTitle.Text = ($titlePrefix + $label)
     $c.Legend.Position=$xlLegendBottom
     try{ $c.SeriesCollection().Delete() }catch{}
     [int]$endRow=1+[int]$n
-    $rgb=Get-HostColor $h
+    $rgb=Get-HostColor $label
 
-    $s1=$c.SeriesCollection().NewSeries(); $s1.Name=$h
+    $s1=$c.SeriesCollection().NewSeries(); $s1.Name=$label
     $s1.XValues=$ws.Range(("A2:A{0}" -f $endRow)); $s1.Values=$ws.Range(("B2:B{0}" -f $endRow))
     try{
       $s1.Format.Line.ForeColor.RGB=$rgb; $s1.Format.Line.Weight=2
-      $s1.MarkerStyle = 8; $s1.MarkerSize = 5   # xlMarkerStyleCircle
+      $s1.MarkerStyle = 8; $s1.MarkerSize = 5
     }catch{}
 
     $s2=$c.SeriesCollection().NewSeries(); $s2.Name=('threshold ' + [int]$ThresholdMs + ' ms')
@@ -417,7 +456,7 @@ try{
 
     $created += $sn
     $ws=$null
-    Write-Host ("[INFO] {0}: rowsIdx={1}, plotted points={2}" -f $h, $rowsIdx.Count, $n)
+    Write-Host ("[INFO] label='{0}': rowsIdx={1}, plotted points={2}" -f $label, $rowsIdx.Count, $n)
   }
 
   if(-not $created -or $created.Count -eq 0){
@@ -437,9 +476,9 @@ try{
       }
       $wsDbg.Columns.AutoFit() | Out-Null
       $wb.SaveAs($Output)
-      Write-Warning ("No data matched hosts in target.txt. DEBUG sheet written to: {0}" -f $Output)
+      Write-Warning ("No data matched keys in target.txt. DEBUG sheet written to: {0}" -f $Output)
     }catch{}
-    throw 'No data matched hosts in target.txt'
+    throw 'No data matched keys in target.txt'
   }
 
   # INDEX
