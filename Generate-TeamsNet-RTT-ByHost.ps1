@@ -2,8 +2,8 @@
 Generate-TeamsNet-RTT-ByHost.ps1
 - Bucketed & locale-safe (no worksheet formulas)
 - PowerShell-side aggregation (sum/count -> avg) per host
-- XY(Scatter with lines) so X is true time, always sorted ascending
-- Y axis: 0..300 ms, X axis: hourly ticks, 100 ms red dashed threshold
+- XY(Scatter with lines): X is true time (OADate), always sorted ascending
+- Y axis: 0..300 ms, X axis: hourly ticks, 100 ms red dashed threshold (configurable)
 - Always prints full error details and ALWAYS releases Excel (success or failure)
 
 Save as: UTF-8 with BOM, CRLF
@@ -47,7 +47,7 @@ function Format-ErrorRecord {
   }
   if($ex){
     $lines.Add(('Type    : {0}' -f $ex.GetType().FullName))
-    if($ex.HResult){ $lines.Add(('HResult : 0x{0:X8}' -f $ex.HResult)) }
+    try { if($ex.HResult -ne $null){ $lines.Add(('HResult : 0x{0:X8}' -f $ex.HResult)) } } catch {}
     if($ex.Message){ $lines.Add(('Message : {0}' -f $ex.Message)) }
     if($ex.StackTrace){ $lines.Add('StackTrace:'); $lines.Add($ex.StackTrace) }
     if($Err.ScriptStackTrace){ $lines.Add('ScriptStackTrace:'); $lines.Add($Err.ScriptStackTrace) }
@@ -72,24 +72,26 @@ function Sanitize-SheetName([string]$name){
 }
 function Get-HostColor([string]$HostName){
   $palette=@(
-    @{r= 33; g=150; b=243}, @{r= 76; g=175; b= 80}, @{r=244; g= 67; b= 54},
-    @{r=255; g=193; b=  7}, @{r=156; g= 39; b=176}, @{r=  0; g=188; b=212},
-    @{r=121; g= 85; b= 72}, @{r= 63; g= 81; b=181}, @{r=205; g=220; b= 57},
-    @{r=233; g= 30; b= 99}
+    @{r=33; g=150; b=243}, @{r=76; g=175; b=80}, @{r=244; g=67; b=54},
+    @{r=255; g=193; b=7},  @{r=156; g=39;  b=176}, @{r=0;  g=188; b=212},
+    @{r=121; g=85;  b=72}, @{r=63; g=81;  b=181}, @{r=205; g=220; b=57},
+    @{r=233; g=30;  b=99}
   )
   $sum=0; $HostName.ToCharArray() | ForEach-Object { $sum += [int]$_ }
   $c=$palette[$sum % $palette.Count]
-  return [int]($c.r + ($c.g -shl 8) + ($c.b -shl 16))
+  [int]$rgb = ([int]$c.r) -bor (([int]$c.g) -shl 8) -bor (([int]$c.b) -shl 16)
+  return $rgb
 }
 function Write-Column2D($ws, [string]$addr, [object[]]$arr){
-  $n = if($arr){ [int]$arr.Count } else { 0 }
+  [int]$n = if($arr){ [int]$arr.Count } else { 0 }
   if($n -le 0){ return }
-  $data = New-Object 'object[,]' $n,1
+  $data = New-Object 'object[,]' ([int]$n),([int]1)
   for($i=0;$i -lt $n;$i++){ $data[$i,0]=$arr[$i] }
-  $ws.Range($addr).Resize($n,1).Value2 = $data
+  $ws.Range($addr).Resize([int]$n,1).Value2 = $data
 }
 function New-RepeatedArray([object]$value, [int]$count){
   if($count -le 0){ return @() }
+  $count = [int]$count
   $a = New-Object object[] $count
   for($i=0;$i -lt $count;$i++){ $a[$i] = $value }
   return $a
@@ -101,11 +103,11 @@ function Release-Com([object]$obj){
 }
 
 # ---- Excel consts ----
-$xlDelimited=1; $xlYes=1; $xlLine=4; $xlLegendBottom=-4107
-$xlSrcRange=1; $xlInsertDeleteCells=2; $xlCellTypeVisible=12
-$xlUp=-4162; $xlCategory=1; $xlValue=2; $xlTimeScale=3
-$msoLineDash=4
-$xlXYScatterLinesNoMarkers = 75
+[int]$xlDelimited=1; [int]$xlYes=1; [int]$xlLine=4; [int]$xlLegendBottom=-4107
+[int]$xlSrcRange=1; [int]$xlInsertDeleteCells=2; [int]$xlCellTypeVisible=12
+[int]$xlUp=-4162; [int]$xlCategory=1; [int]$xlValue=2; [int]$xlTimeScale=3
+[int]$msoLineDash=4
+[int]$xlXYScatterLinesNoMarkers = 75
 
 # ---- inputs ----
 $csv = Join-Path $InputDir 'teams_net_quality.csv'
@@ -124,6 +126,11 @@ $targets = Get-Content -Raw -Encoding UTF8 $TargetsFile |
   Where-Object { $_ -and (-not $_.Trim().StartsWith('#')) } |
   ForEach-Object { $_.Trim() } | Select-Object -Unique
 if(-not $targets -or $targets.Count -eq 0){ throw 'No valid hosts in target.txt' }
+
+# normalize bucket minutes and precompute fraction of a day
+$BucketMinutes = [int]$BucketMinutes
+if($BucketMinutes -lt 1){ $BucketMinutes = 60 }
+[double]$frac = [double]$BucketMinutes / 1440.0
 
 # ---- main with guaranteed cleanup ----
 $excel=$null; $wb=$null; $wsAll=$null
@@ -170,7 +177,6 @@ try {
 
   # per host
   $created=@()
-  $frac = [double]$BucketMinutes / 1440.0
   $ciInv = [System.Globalization.CultureInfo]::InvariantCulture
   $ciCur = [System.Globalization.CultureInfo]::CurrentCulture
 
@@ -196,7 +202,7 @@ try {
     $lastRow = $ws.Cells($ws.Rows.Count,1).End($xlUp).Row
     if($lastRow -lt 2){ try { $null = $loAll.AutoFilter.ShowAllData() } catch {}; continue }
 
-    $ws.Range("C2:C$lastRow").Value2 = $ThresholdMs
+    $ws.Range("C2:C$lastRow").Value2 = [int]$ThresholdMs
     try { $ws.Range("A2:A$lastRow").NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
     try { $ws.Range("B2:B$lastRow").NumberFormatLocal='0.0' } catch {}
 
@@ -206,59 +212,62 @@ try {
     if(-not ($rngAraw -is [Array])){ $rngA = New-Object 'object[,]' 1,1; $rngA[0,0]=$rngAraw } else { $rngA=$rngAraw }
     if(-not ($rngBraw -is [Array])){ $rngB = New-Object 'object[,]' 1,1; $rngB[0,0]=$rngBraw } else { $rngB=$rngBraw }
 
-    $rows = $rngA.GetLength(0)
+    [int]$rows = $rngA.GetLength(0)
     $times = New-Object double[] $rows
     $rtts  = New-Object double[] $rows
     for($i=0;$i -lt $rows;$i++){
       $t = $rngA[$i,0]
-      if($t -is [double]){ $tNum = [double]$t }
+      if($t -is [double]){ [double]$tNum = [double]$t }
       else {
         $tStr = [string]$t
         try { $dt = [datetime]::Parse($tStr, $ciCur) } catch { try { $dt = [datetime]::Parse($tStr, $ciInv) } catch { continue } }
-        $tNum = $dt.ToOADate()
+        [double]$tNum = $dt.ToOADate()
       }
       $v = $rngB[$i,0]
-      if($v -is [double]){ $rNum = [double]$v }
+      if($v -is [double]){ [double]$rNum = [double]$v }
       else {
         $tmp=0.0
-        if([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $ciInv, [ref]$tmp)){ $rNum = $tmp }
-        elseif([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $ciCur, [ref]$tmp)){ $rNum = $tmp }
+        if([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $ciInv, [ref]$tmp)){ [double]$rNum = $tmp }
+        elseif([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $ciCur, [ref]$tmp)){ [double]$rNum = $tmp }
         else { continue }
       }
       $times[$i]=$tNum; $rtts[$i]=$rNum
     }
 
-    $agg = @{}  # bucket -> {sum,cnt}
+    # bucket -> {sum,cnt}
+    $agg = @{}
     for($i=0;$i -lt $rows;$i++){
-      $t=[double]$times[$i]; $r=[double]$rtts[$i]
+      [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
       if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
-      $b = [math]::Floor($t / $frac) * $frac
+      [double]$b = [math]::Floor($t / $frac) * $frac
       $entry = $agg[$b]
-      if(-not $entry){ $entry = @{sum=0.0; cnt=0}; $agg[$b]=$entry }
-      $entry.sum = $entry.sum + $r
-      $entry.cnt = $entry.cnt + 1
+      if(-not $entry){ $entry = @{sum=[double]0.0; cnt=[int]0}; $agg[$b]=$entry }
+      $entry.sum = [double]($entry.sum + $r)
+      $entry.cnt = [int]($entry.cnt + 1)
     }
 
     $useBuckets = ($agg.Keys.Count -ge 2)
     if($useBuckets){
-      # sort keys strictly by numeric (OADate) to ensure time order
-      $keys = @($agg.Keys) | Sort-Object { [double]$_ }
-      $xs = New-Object object[] $keys.Count
-      $ys = New-Object object[] $keys.Count
-      for($k=0;$k -lt $keys.Count;$k++){
-        $b = [double]$keys[$k]
-        $avg = if($agg[$b].cnt -gt 0){ $agg[$b].sum / $agg[$b].cnt } else { [double]::NaN }
+      # sort keys strictly as numeric (OADate)
+      $keys = @($agg.Keys) | Sort-Object {[double]$_}
+      [int]$kCount = $keys.Count
+      $xs = New-Object object[] $kCount
+      $ys = New-Object object[] $kCount
+      for($k=0;$k -lt $kCount;$k++){
+        [double]$b = $keys[$k]
+        [double]$avg = if($agg[$b].cnt -gt 0){ $agg[$b].sum / $agg[$b].cnt } else { [double]::NaN }
         $xs[$k] = $b; $ys[$k] = $avg
       }
+
       $ws.Cells(1,6).Value2='bucket'
       $ws.Cells(1,7).Value2='avg_rtt'
       $ws.Cells(1,8).Value2='threshold_bucket'
       Write-Column2D $ws "F2" $xs
       Write-Column2D $ws "G2" $ys
-      $thr = New-RepeatedArray -value $ThresholdMs -count $xs.Count
+      $thr = New-RepeatedArray -value ([double]$ThresholdMs) -count $kCount
       Write-Column2D $ws "H2" $thr
-      try { $ws.Range(("F2:F{0}" -f (1+$xs.Count))).NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
-      try { $ws.Range(("G2:G{0}" -f (1+$ys.Count))).NumberFormatLocal='0.0' } catch {}
+      try { $ws.Range(("F2:F{0}" -f (1 + [int]$kCount))).NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
+      try { $ws.Range(("G2:G{0}" -f (1 + [int]$kCount))).NumberFormatLocal='0.0' } catch {}
       $null = $ws.Columns("A:H").AutoFit()
 
       try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
@@ -267,40 +276,41 @@ try {
       $c.ChartTitle.Text = 'RTT hourly avg (icmp_avg_ms) - ' + $h
       $c.Legend.Position = $xlLegendBottom
       try { $c.SeriesCollection().Delete() } catch {}
+      [int]$endRow = 1 + [int]$kCount
       $rgb = Get-HostColor $h
-      $endRow = 1 + $xs.Count
       $s1 = $c.SeriesCollection().NewSeries(); $s1.Name=$h
       $s1.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s1.Values = $ws.Range(("G2:G{0}" -f $endRow))
       try { $s1.Format.Line.ForeColor.RGB = $rgb; $s1.Format.Line.Weight = 2 } catch {}
-      $s2 = $c.SeriesCollection().NewSeries(); $s2.Name='threshold ' + $ThresholdMs + ' ms'
+      $s2 = $c.SeriesCollection().NewSeries(); $s2.Name=('threshold ' + [int]$ThresholdMs + ' ms')
       $s2.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s2.Values = $ws.Range(("H2:H{0}" -f $endRow))
       try { $s2.Format.Line.ForeColor.RGB = 255; $s2.Format.Line.Weight = 1.5; $s2.Format.Line.DashStyle = $msoLineDash } catch {}
       try {
-        $v = $c.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
-        $x = $c.Axes($xlCategory); $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
+        $v = $c.Axes($xlValue);    $v.MinimumScale=[double]0;   $v.MaximumScale=[double]300; $v.MajorUnit=[double]50; $v.TickLabels.NumberFormat='0.0'
+        $x = $c.Axes($xlCategory); $x.MajorUnit=[double](1.0/24.0);                           $x.TickLabels.NumberFormat='mm/dd hh:mm'
       } catch {}
     }
     else {
       # raw fallback: build pairs, sort ascending by time, then write to F/G/H and chart as XY
       $pairs = @()
       for($i=0;$i -lt $rows;$i++){
-        $t=[double]$times[$i]; $r=[double]$rtts[$i]
+        [double]$t=[double]$times[$i]; [double]$r=[double]$rtts[$i]
         if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
         $pairs += [pscustomobject]@{ t=$t; r=$r }
       }
       $pairs = $pairs | Sort-Object t
 
       $xs = @(); $ys = @()
-      foreach($p in $pairs){ $xs += $p.t; $ys += $p.r }
+      foreach($p in $pairs){ $xs += [double]$p.t; $ys += [double]$p.r }
+      [int]$rc = [int]$xs.Count
 
       $ws.Cells(1,6).Value2='time'
       $ws.Cells(1,7).Value2='rtt_raw'
       $ws.Cells(1,8).Value2='threshold'
       Write-Column2D $ws "F2" $xs
       Write-Column2D $ws "G2" $ys
-      Write-Column2D $ws "H2" (New-RepeatedArray -value $ThresholdMs -count $xs.Count)
-      try { $ws.Range(("F2:F{0}" -f (1+$xs.Count))).NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
-      try { $ws.Range(("G2:G{0}" -f (1+$ys.Count))).NumberFormatLocal='0.0' } catch {}
+      Write-Column2D $ws "H2" (New-RepeatedArray -value ([double]$ThresholdMs) -count $rc)
+      try { $ws.Range(("F2:F{0}" -f (1 + [int]$rc))).NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
+      try { $ws.Range(("G2:G{0}" -f (1 + [int]$rc))).NumberFormatLocal='0.0' } catch {}
       $null = $ws.Columns("A:H").AutoFit()
 
       try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
@@ -309,17 +319,17 @@ try {
       $c.ChartTitle.Text = 'RTT (raw) - ' + $h
       $c.Legend.Position = $xlLegendBottom
       try { $c.SeriesCollection().Delete() } catch {}
+      [int]$endRow = 1 + [int]$rc
       $rgb = Get-HostColor $h
-      $endRow = 1 + $xs.Count
       $s1 = $c.SeriesCollection().NewSeries(); $s1.Name=$h
       $s1.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s1.Values = $ws.Range(("G2:G{0}" -f $endRow))
       try { $s1.Format.Line.ForeColor.RGB = $rgb; $s1.Format.Line.Weight = 2 } catch {}
-      $s2 = $c.SeriesCollection().NewSeries(); $s2.Name='threshold ' + $ThresholdMs + ' ms'
+      $s2 = $c.SeriesCollection().NewSeries(); $s2.Name=('threshold ' + [int]$ThresholdMs + ' ms')
       $s2.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s2.Values = $ws.Range(("H2:H{0}" -f $endRow))
       try { $s2.Format.Line.ForeColor.RGB = 255; $s2.Format.Line.Weight = 1.5; $s2.Format.Line.DashStyle = $msoLineDash } catch {}
       try {
-        $v = $c.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
-        $x = $c.Axes($xlCategory); $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
+        $v = $c.Axes($xlValue);    $v.MinimumScale=[double]0;   $v.MaximumScale=[double]300; $v.MajorUnit=[double]50; $v.TickLabels.NumberFormat='0.0'
+        $x = $c.Axes($xlCategory); $x.MajorUnit=[double](1.0/24.0);                           $x.TickLabels.NumberFormat='mm/dd hh:mm'
       } catch {}
     }
 
@@ -349,19 +359,16 @@ catch {
   throw
 }
 finally {
-  # close workbook first
   if($wb){
     try { $wb.Close($false) } catch {}
     Release-Com $wb
     $wb = $null
   }
-  # quit Excel last
   if($excel){
     try { $excel.Quit() } catch {}
     Release-Com $excel
     $excel = $null
   }
-  # extra GC passes help tear down COM RCWs
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
