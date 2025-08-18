@@ -1,7 +1,17 @@
 <#
 Generate-TeamsNet-RTT-ByHost.ps1
 - Bucketed & locale-safe (no worksheet formulas)
-- Always releases Excel COM objects in finally, regardless of success/failure.
+- PowerShell-side aggregation (sum/count -> avg) per host
+- Y axis: 0..300 ms, X axis: hourly ticks, 100 ms red dashed threshold
+- Always prints full error details and ALWAYS releases Excel (success or failure)
+
+Save as: UTF-8 with BOM, CRLF
+Usage:
+  powershell -NoProfile -ExecutionPolicy Bypass `
+    -File .\Generate-TeamsNet-RTT-ByHost.ps1 `
+    -Output ".\Output\TeamsNet-RTT-ByHost.xlsx" `
+    -TargetsFile ".\target.txt" `
+    -BucketMinutes 60
 #>
 
 param(
@@ -13,14 +23,45 @@ param(
   [switch]$Visible
 )
 
-# Excel consts
-$xlDelimited=1; $xlYes=1; $xlLine=4; $xlLegendBottom=-4107
-$xlSrcRange=1; $xlInsertDeleteCells=2; $xlCellTypeVisible=12
-$xlUp=-4162; $xlCategory=1; $xlValue=2; $xlTimeScale=3
-$msoLineDash=4
+# ---- error reporting: always stop + full dump ----
+$Error.Clear()
+$ErrorActionPreference = 'Stop'
+$PSDefaultParameterValues['*:ErrorAction'] = 'Stop'
+$global:ErrorView = 'NormalView'
 
-$ErrorActionPreference='Stop'
+function Format-ErrorRecord {
+  param([System.Management.Automation.ErrorRecord]$Err)
+  $ex = $Err.Exception
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add('ERROR -----')
+  $lines.Add(('FQID   : {0}' -f $Err.FullyQualifiedErrorId))
+  if($Err.CategoryInfo){ $lines.Add(('Category: {0}' -f $Err.CategoryInfo.ToString())) }
+  if($Err.TargetObject){ $lines.Add(('Target  : {0}' -f $Err.TargetObject)) }
+  if($Err.InvocationInfo){
+    $ii = $Err.InvocationInfo
+    $lines.Add(('Script  : {0}' -f $ii.ScriptName))
+    $lines.Add(('Line    : {0}  Char : {1}' -f $ii.ScriptLineNumber, $ii.OffsetInLine))
+    if($ii.Line){ $lines.Add(('Code    : {0}' -f $ii.Line.Trim())) }
+    if($ii.PositionMessage){ $lines.Add($ii.PositionMessage) }
+  }
+  if($ex){
+    $lines.Add(('Type    : {0}' -f $ex.GetType().FullName))
+    if($ex.HResult){ $lines.Add(('HResult : 0x{0:X8}' -f $ex.HResult)) }
+    if($ex.Message){ $lines.Add(('Message : {0}' -f $ex.Message)) }
+    if($ex.StackTrace){ $lines.Add('StackTrace:'); $lines.Add($ex.StackTrace) }
+    if($Err.ScriptStackTrace){ $lines.Add('ScriptStackTrace:'); $lines.Add($Err.ScriptStackTrace) }
+    $ix = $ex.InnerException; $n = 1
+    while($ix){
+      $lines.Add(('Inner[{0}] Type   : {1}' -f $n, $ix.GetType().FullName))
+      $lines.Add(('Inner[{0}] Message: {1}' -f $n, $ix.Message))
+      if($ix.StackTrace){ $lines.Add($ix.StackTrace) }
+      $ix = $ix.InnerException; $n++
+    }
+  }
+  return ($lines -join [Environment]::NewLine)
+}
 
+# ---- helpers ----
 function Sanitize-SheetName([string]$name){
   if(-not $name){ return 'Host' }
   $n = $name -replace '[:\\/\?\*\[\]]','_'
@@ -58,7 +99,13 @@ function Release-Com([object]$obj){
   }
 }
 
-# ---------- inputs ----------
+# ---- Excel consts ----
+$xlDelimited=1; $xlYes=1; $xlLine=4; $xlLegendBottom=-4107
+$xlSrcRange=1; $xlInsertDeleteCells=2; $xlCellTypeVisible=12
+$xlUp=-4162; $xlCategory=1; $xlValue=2; $xlTimeScale=3
+$msoLineDash=4
+
+# ---- inputs ----
 $csv = Join-Path $InputDir 'teams_net_quality.csv'
 if(-not (Test-Path $csv)){ throw 'CSV not found: ' + $csv }
 
@@ -76,7 +123,7 @@ $targets = Get-Content -Raw -Encoding UTF8 $TargetsFile |
   ForEach-Object { $_.Trim() } | Select-Object -Unique
 if(-not $targets -or $targets.Count -eq 0){ throw 'No valid hosts in target.txt' }
 
-# ---------- main with guaranteed cleanup ----------
+# ---- main with guaranteed cleanup ----
 $excel=$null; $wb=$null; $wsAll=$null
 try {
   # Excel
@@ -88,7 +135,7 @@ try {
   $wb.Worksheets.Item(1).Name = 'AllData'
   $wsAll = $wb.Worksheets('AllData')
 
-  # import CSV
+  # import CSV to ListObject
   try { foreach($qt in @($wsAll.QueryTables())){ $qt.Delete() } } catch {}
   try { foreach($lo in @($wsAll.ListObjects())){ $lo.Unlist() } } catch {}
   $wsAll.Cells.Clear()
@@ -151,7 +198,7 @@ try {
     try { $ws.Range("A2:A$lastRow").NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
     try { $ws.Range("B2:B$lastRow").NumberFormatLocal='0.0' } catch {}
 
-    # read raw and aggregate
+    # read raw and aggregate (PowerShell)
     $rngAraw = $ws.Range("A2:A$lastRow").Value2
     $rngBraw = $ws.Range("B2:B$lastRow").Value2
     if(-not ($rngAraw -is [Array])){ $rngA = New-Object 'object[,]' 1,1; $rngA[0,0]=$rngAraw } else { $rngA=$rngAraw }
@@ -266,9 +313,12 @@ try {
   try { $wb.Worksheets('AllData').Move($wb.Worksheets.Item($wb.Worksheets.Count)) } catch {}
 
   $wb.SaveAs($Output)
+  Write-Host ('Output: ' + $Output)
 }
 catch {
-  Write-Error $_
+  # always dump FULL error text
+  $msg = Format-ErrorRecord -Err $_
+  Write-Error $msg
   throw
 }
 finally {
@@ -288,5 +338,3 @@ finally {
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 }
-
-Write-Host ('Output: ' + $Output)

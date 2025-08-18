@@ -1,59 +1,69 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-rem === Paths (use files next to this .bat) ===
+rem ===== change to script directory (handles UNC via temporary drive mapping) =====
 set "BASE=%~dp0"
+pushd "%BASE%" >nul 2>nul
+
+rem ===== paths =====
 set "PS1=%BASE%Generate-TeamsNet-RTT-ByHost.ps1"
 if not exist "%PS1%" (
   echo ERROR: PS1 not found: "%PS1%"
-  exit /b 1
+  popd & exit /b 1
 )
 
-rem === Output: BASE\Output\yyyyMMdd_HHmmss\TeamsNet-RTT-ByHost.xlsx ===
 set "OUTROOT=%BASE%Output"
-if not exist "%OUTROOT%" mkdir "%OUTROOT%" >nul
+if not exist "%OUTROOT%" mkdir "%OUTROOT%" >nul 2>nul
 
-for /f "usebackq delims=" %%T in (`powershell -NoProfile -Command "[DateTime]::Now.ToString('yyyyMMdd_HHmmss')"`) do set "TS=%%T"
+rem ===== timestamp (locale-agnostic using cmd variables) =====
+set "YYYY=%date:~0,4%"
+set "MM=%date:~5,2%"
+set "DD=%date:~8,2%"
+set "HH=%time:~0,2%"
+set "NN=%time:~3,2%"
+set "SS=%time:~6,2%"
+rem zero-pad hour if space-padded
+set "HH=%HH: =0%"
+set "TS=%YYYY%%MM%%DD%_%HH%%NN%%SS%"
+
 set "OUTDIR=%OUTROOT%\%TS%"
 mkdir "%OUTDIR%" >nul 2>nul
 set "OUT=%OUTDIR%\TeamsNet-RTT-ByHost.xlsx"
 set "LOG=%OUTDIR%\run.log"
 
-rem === Optional targets file (target.txt beside this .bat) ===
+rem ===== optional targets file placed next to this .bat =====
 set "TARGET=%BASE%target.txt"
 set "TARGETARG="
 if exist "%TARGET%" set "TARGETARG=-TargetsFile ""%TARGET%"""
 
-rem === Choose PowerShell (Windows PowerShell -> PowerShell 7) ===
+rem ===== choose PowerShell host (Windows PowerShell > PowerShell 7) =====
 set "PSCMD="
-where powershell >nul 2>nul  && set "PSCMD=powershell -NoProfile -ExecutionPolicy Bypass"
+where powershell.exe >nul 2>nul && set "PSCMD=powershell.exe -NoProfile -ExecutionPolicy Bypass"
 if not defined PSCMD (
-  where pwsh >nul 2>nul && set "PSCMD=pwsh -NoProfile -ExecutionPolicy Bypass"
+  where pwsh.exe >nul 2>nul && set "PSCMD=pwsh.exe -NoProfile -ExecutionPolicy Bypass"
 )
 if not defined PSCMD (
-  echo ERROR: PowerShell not found.
-  exit /b 1
+  echo ERROR: PowerShell not found in PATH.
+  popd & exit /b 1
 )
 
+rem ===== run =====
 echo Command: %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG% > "%LOG%"
 %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG% 1>>"%LOG%" 2>&1
-if errorlevel 1 goto :fail
+set "ERR=%ERRORLEVEL%"
+
+if not "%ERR%"=="0" (
+  echo FAILED with exit code %ERR%
+  echo See log: "%LOG%"
+  popd & exit /b %ERR%
+)
 
 if exist "%OUT%" (
   echo DONE: "%OUT%"
   start "" "%OUT%" 2>nul
-  exit /b 0
+  popd & exit /b 0
 ) else (
-  echo ERROR: Script returned success but output missing.
+  echo ERROR: Script returned success but output file is missing.
   echo See log: "%LOG%"
-  exit /b 2
+  popd & exit /b 2
 )
-
-:fail
-echo FAILED with exit code %errorlevel%
-echo See log: "%LOG%"
-echo Hints: >> "%LOG%"
-echo 1^) Ensure teams_net_quality.csv exists under %%LOCALAPPDATA%%\TeamsNet >> "%LOG%"
-echo 2^) Ensure Microsoft Excel is installed and not blocked >> "%LOG%"
-echo 3^) Check write permission or file lock in "!OUTDIR!" >> "%LOG%"
-exit /b %errorlevel%
