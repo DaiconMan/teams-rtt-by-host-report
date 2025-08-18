@@ -2,6 +2,7 @@
 Generate-TeamsNet-RTT-ByHost.ps1
 - Bucketed & locale-safe (no worksheet formulas)
 - PowerShell-side aggregation (sum/count -> avg) per host
+- XY(Scatter with lines) so X is true time, always sorted ascending
 - Y axis: 0..300 ms, X axis: hourly ticks, 100 ms red dashed threshold
 - Always prints full error details and ALWAYS releases Excel (success or failure)
 
@@ -104,6 +105,7 @@ $xlDelimited=1; $xlYes=1; $xlLine=4; $xlLegendBottom=-4107
 $xlSrcRange=1; $xlInsertDeleteCells=2; $xlCellTypeVisible=12
 $xlUp=-4162; $xlCategory=1; $xlValue=2; $xlTimeScale=3
 $msoLineDash=4
+$xlXYScatterLinesNoMarkers = 75
 
 # ---- inputs ----
 $csv = Join-Path $InputDir 'teams_net_quality.csv'
@@ -239,7 +241,8 @@ try {
 
     $useBuckets = ($agg.Keys.Count -ge 2)
     if($useBuckets){
-      $keys = $agg.Keys | Sort-Object
+      # sort keys strictly by numeric (OADate) to ensure time order
+      $keys = @($agg.Keys) | Sort-Object { [double]$_ }
       $xs = New-Object object[] $keys.Count
       $ys = New-Object object[] $keys.Count
       for($k=0;$k -lt $keys.Count;$k++){
@@ -260,7 +263,7 @@ try {
 
       try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
       $ch = $ws.ChartObjects().Add(300,10,900,320)
-      $c = $ch.Chart; $c.ChartType = $xlLine; $c.HasTitle=$true
+      $c = $ch.Chart; $c.ChartType = $xlXYScatterLinesNoMarkers; $c.HasTitle=$true
       $c.ChartTitle.Text = 'RTT hourly avg (icmp_avg_ms) - ' + $h
       $c.Legend.Position = $xlLegendBottom
       try { $c.SeriesCollection().Delete() } catch {}
@@ -273,26 +276,50 @@ try {
       $s2.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s2.Values = $ws.Range(("H2:H{0}" -f $endRow))
       try { $s2.Format.Line.ForeColor.RGB = 255; $s2.Format.Line.Weight = 1.5; $s2.Format.Line.DashStyle = $msoLineDash } catch {}
       try {
-        $v = $c.Axes($xlValue); $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
-        $x = $c.Axes($xlCategory); $x.CategoryType=$xlTimeScale; $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
+        $v = $c.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
+        $x = $c.Axes($xlCategory); $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
       } catch {}
-    } else {
+    }
+    else {
+      # raw fallback: build pairs, sort ascending by time, then write to F/G/H and chart as XY
+      $pairs = @()
+      for($i=0;$i -lt $rows;$i++){
+        $t=[double]$times[$i]; $r=[double]$rtts[$i]
+        if([double]::IsNaN($t) -or [double]::IsNaN($r)){ continue }
+        $pairs += [pscustomobject]@{ t=$t; r=$r }
+      }
+      $pairs = $pairs | Sort-Object t
+
+      $xs = @(); $ys = @()
+      foreach($p in $pairs){ $xs += $p.t; $ys += $p.r }
+
+      $ws.Cells(1,6).Value2='time'
+      $ws.Cells(1,7).Value2='rtt_raw'
+      $ws.Cells(1,8).Value2='threshold'
+      Write-Column2D $ws "F2" $xs
+      Write-Column2D $ws "G2" $ys
+      Write-Column2D $ws "H2" (New-RepeatedArray -value $ThresholdMs -count $xs.Count)
+      try { $ws.Range(("F2:F{0}" -f (1+$xs.Count))).NumberFormatLocal='yyyy/mm/dd hh:mm' } catch {}
+      try { $ws.Range(("G2:G{0}" -f (1+$ys.Count))).NumberFormatLocal='0.0' } catch {}
+      $null = $ws.Columns("A:H").AutoFit()
+
       try { foreach($co in @($ws.ChartObjects())){ $co.Delete() } } catch {}
       $ch = $ws.ChartObjects().Add(300,10,900,320)
-      $c = $ch.Chart; $c.ChartType = $xlLine; $c.HasTitle=$true
+      $c = $ch.Chart; $c.ChartType = $xlXYScatterLinesNoMarkers; $c.HasTitle=$true
       $c.ChartTitle.Text = 'RTT (raw) - ' + $h
       $c.Legend.Position = $xlLegendBottom
       try { $c.SeriesCollection().Delete() } catch {}
       $rgb = Get-HostColor $h
+      $endRow = 1 + $xs.Count
       $s1 = $c.SeriesCollection().NewSeries(); $s1.Name=$h
-      $s1.XValues = $ws.Range("A2:A$lastRow"); $s1.Values = $ws.Range("B2:B$lastRow")
+      $s1.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s1.Values = $ws.Range(("G2:G{0}" -f $endRow))
       try { $s1.Format.Line.ForeColor.RGB = $rgb; $s1.Format.Line.Weight = 2 } catch {}
       $s2 = $c.SeriesCollection().NewSeries(); $s2.Name='threshold ' + $ThresholdMs + ' ms'
-      $s2.XValues = $ws.Range("A2:A$lastRow"); $s2.Values = $ws.Range("C2:C$lastRow")
+      $s2.XValues = $ws.Range(("F2:F{0}" -f $endRow)); $s2.Values = $ws.Range(("H2:H{0}" -f $endRow))
       try { $s2.Format.Line.ForeColor.RGB = 255; $s2.Format.Line.Weight = 1.5; $s2.Format.Line.DashStyle = $msoLineDash } catch {}
       try {
-        $v = $c.Axes($xlValue); $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
-        $x = $c.Axes($xlCategory); $x.CategoryType=$xlTimeScale; $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
+        $v = $c.Axes($xlValue);    $v.MinimumScale=0; $v.MaximumScale=300; $v.MajorUnit=50; $v.TickLabels.NumberFormat='0.0'
+        $x = $c.Axes($xlCategory); $x.MajorUnit=1/24; $x.TickLabels.NumberFormat='mm/dd hh:mm'
       } catch {}
     }
 
