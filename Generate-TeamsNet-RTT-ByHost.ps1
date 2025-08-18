@@ -1,3 +1,4 @@
+
 <#
 Generate-TeamsNet-RTT-ByHost.ps1
 - Chart from A/B/C only (no F-H) to avoid axis mismatch
@@ -72,8 +73,8 @@ function Sanitize-SheetName([string]$name){
 function Get-HostColor([string]$HostName){
   $palette=@(
     @{r=33; g=150; b=243}, @{r=76; g=175; b=80}, @{r=244; g=67; b=54},
-    @{r=255; g=193; b=7},  @{r=156; g=39; b=176}, @{r=0; g=188; b=212},
-    @{r=121; g=85;  b=72}, @{r=63; g=81; b=181}, @{r=205; g=220; b=57},
+    @{r=255; g=193; b=7},  @{r=156; g=39;  b=176}, @{r=0;  g=188; b=212},
+    @{r=121; g=85;  b=72}, @{r=63; g=81;  b=181}, @{r=205; g=220; b=57},
     @{r=233; g=30;  b=99}
   )
   $sum=0; $HostName.ToCharArray() | ForEach-Object { $sum+=[int]$_ }
@@ -118,7 +119,7 @@ if(-not $TargetsFile){
 }
 if(-not (Test-Path $TargetsFile)){ throw 'Targets file not found: ' + $TargetsFile }
 
-# ※ Windows PowerShell 互換のため -Raw/-split 正規表現は使わず素直に行取得
+# PS5.1互換：素直に行単位で読む
 $targets = Get-Content -Encoding UTF8 $TargetsFile |
   ForEach-Object { $_.Trim() } |
   Where-Object { $_ -and (-not $_.StartsWith('#')) } |
@@ -258,8 +259,10 @@ try{
     try{ foreach($co in @($ws.ChartObjects())){ $co.Delete() } }catch{}
     $ch=$ws.ChartObjects().Add(300,10,900,320)
     $c=$ch.Chart; $c.ChartType=$xlXYScatterLinesNoMarkers; $c.HasTitle=$true
-    $titlePrefix = if($useBuckets){ 'RTT hourly avg (icmp_avg_ms) - ' } else { 'RTT (raw) - ' }  # ← 三項演算子の代替
-    $c.ChartTitle.Text = $titlePrefix + $h
+    # PS5.1互換：if式を使わずに事前に変数を設定
+    $titlePrefix = 'RTT (raw) - '
+    if ($useBuckets) { $titlePrefix = 'RTT hourly avg (icmp_avg_ms) - ' }
+    $c.ChartTitle.Text = ($titlePrefix + $h)
     $c.Legend.Position=$xlLegendBottom
     try{ $c.SeriesCollection().Delete() }catch{}
     [int]$endRow=1+[int]$n
