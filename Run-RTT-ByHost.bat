@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 
-rem ===== change to script directory (handles UNC via temporary drive mapping) =====
+rem ===== move to script directory (handles UNC/OneDrive paths safely) =====
 set "BASE=%~dp0"
 pushd "%BASE%" >nul 2>nul
 
@@ -15,14 +15,14 @@ if not exist "%PS1%" (
 set "OUTROOT=%BASE%Output"
 if not exist "%OUTROOT%" mkdir "%OUTROOT%" >nul 2>nul
 
-rem ===== timestamp (locale-agnostic using cmd variables) =====
+rem ===== timestamp (locale-agnostic via %date%/%time% slicing) =====
 set "YYYY=%date:~0,4%"
 set "MM=%date:~5,2%"
 set "DD=%date:~8,2%"
 set "HH=%time:~0,2%"
 set "NN=%time:~3,2%"
 set "SS=%time:~6,2%"
-rem zero-pad hour if space-padded
+rem space-padded hour -> zero-pad
 set "HH=%HH: =0%"
 set "TS=%YYYY%%MM%%DD%_%HH%%NN%%SS%"
 
@@ -31,12 +31,15 @@ mkdir "%OUTDIR%" >nul 2>nul
 set "OUT=%OUTDIR%\TeamsNet-RTT-ByHost.xlsx"
 set "LOG=%OUTDIR%\run.log"
 
-rem ===== optional targets file placed next to this .bat =====
+rem ===== optional target.txt beside this .bat =====
 set "TARGET=%BASE%target.txt"
-set "TARGETARG="
-if exist "%TARGET%" set "TARGETARG=-TargetsFile ""%TARGET%"""
+set "EXTRA_ARGS="
+if exist "%TARGET%" (
+  rem -> keep as single variable to avoid double quoting
+  set "EXTRA_ARGS=-TargetsFile \"%TARGET%\""
+)
 
-rem ===== choose PowerShell host (Windows PowerShell > PowerShell 7) =====
+rem ===== choose PowerShell host (Windows PowerShell first, then PowerShell 7) =====
 set "PSCMD="
 where powershell.exe >nul 2>nul && set "PSCMD=powershell.exe -NoProfile -ExecutionPolicy Bypass"
 if not defined PSCMD (
@@ -47,9 +50,9 @@ if not defined PSCMD (
   popd & exit /b 1
 )
 
-rem ===== run =====
-echo Command: %PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG% > "%LOG%"
-%PSCMD% -File "%PS1%" -Output "%OUT%" %TARGETARG% 1>>"%LOG%" 2>&1
+rem ===== run and capture stdout/stderr to log =====
+echo Command: %PSCMD% -File "%PS1%" -Output "%OUT%" %EXTRA_ARGS% > "%LOG%"
+%PSCMD% -File "%PS1%" -Output "%OUT%" %EXTRA_ARGS% 1>>"%LOG%" 2>&1
 set "ERR=%ERRORLEVEL%"
 
 if not "%ERR%"=="0" (
