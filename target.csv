@@ -1,0 +1,10 @@
+role,key,label
+# Example CSV file content for target.csv
+# L2,192.168.10.50,8F-L2-Anchor
+# L3,{GATEWAY},VLAN10-GW
+# RTR_LAN,{HOP2},Core-L3
+# RTR_WAN,{HOP3},WAN-Edge
+# ZSCALER,gateway.zscaler.net,Zscaler-Edge
+# SAAS,world.tr.teams.microsoft.com,Teams World
+# SAAS,odc.officeapps.live.com,Office Apps
+# SAAS,login.microsoftonline.com,Azure AD
