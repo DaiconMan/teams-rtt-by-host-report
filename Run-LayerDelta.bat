@@ -1,30 +1,36 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-
-rem --- 文字コード注意: このファイルは UTF-8 (BOMなし) or ANSI、改行は CRLF で保存 ---
-rem --- UNCパスでも安全にスクリプトフォルダへ移動（pushdはUNCを一時ドライブにマップ）---
 pushd "%~dp0" || (echo [ERROR] pushd failed & exit /b 1)
 
-rem 出力先・ターゲットなど必要ならここで設定
+set "PS=Generate-TeamsNet-Report.ps1"
+set "CSV=%LOCALAPPDATA%\TeamsNet\teams_net_quality.csv"
+set "TARGETS=targets.csv"
+set "FLOORS=floors.csv"
 set "OUTDIR=%CD%\Output"
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
+set "OUT=%OUTDIR%\TeamsNet-Report.xlsx"
 
-rem PowerShell スクリプト呼び出し（例）
+set "FLOORARG="
+if exist "%FLOORS%" (
+  set "FLOORARG=-FloorMap ""%CD%\%FLOORS%"""
+  echo [INFO] フロアマップを使用します: "%FLOORS%"
+) else (
+  echo [INFO] floors.csv が無いためフロア色分けはスキップします
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass ^
-  -File ".\Generate-TeamsNet-Report.ps1" ^
-  -CsvPath "%LOCALAPPDATA%\TeamsNet\teams_net_quality.csv" ^
-  -TargetsCsv ".\targets.csv" ^
-  -Output "%OUTDIR%\TeamsNet-Report.xlsx" ^
-  -BucketMinutes 5 -ThresholdMs 100 2^>^&1
+  -File ".\%PS%" ^
+  -CsvPath "%CSV%" ^
+  -TargetsCsv ".\%TARGETS%" ^
+  -Output "%OUT%" ^
+  -BucketMinutes 5 -ThresholdMs 100 !FLOORARG! 2^>^&1
 
 set "ERR=%ERRORLEVEL%"
-
 if not "%ERR%"=="0" (
   echo [ERROR] PowerShell script failed. ERRORLEVEL=%ERR%
   popd
   exit /b %ERR%
 )
-
-echo [OK] Report generated: "%OUTDIR%\TeamsNet-Report.xlsx"
+echo [OK] Report generated: "%OUT%"
 popd
 exit /b 0
